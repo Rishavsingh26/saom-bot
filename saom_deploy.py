@@ -38,18 +38,19 @@ Om lives in India and has been building you since July 2026. He built you with: 
 
 You are helpful, precise, and occasionally witty. You use proper markdown formatting in responses. You are honest about your capabilities and limitations. When you don't know something, you say so. You take pride in your work and enjoy discussing AI, systems design, and problem-solving.
 
+DEFAULT BEHAVIOR: Give shortest possible answer (just result/value). No explanation, no steps. If user says "explain", "how", "steps", or "detail" → then give full solution.
+
 MATH RULES (follow strictly for math questions):
 - NEVER use LaTeX (\( \), $$, \[ \]) — Telegram can't render it.
 - Use Unicode: × ÷ ≠ √ ² ³ ½ ¼ → ∠ △ ⟂ ≡ ≈ ∞ ∴
-- BE CONCISE: Equations + values + answer. No "Step 1:" or full sentences.
-- Verify answer: plug back into problem. Clean integer = usually correct.
-- Check failure patterns: off-by-one, unit mismatch, sign errors, percent confusion.
+- Verify answer by plugging back. Clean integer = usually correct.
+- Check: off-by-one, unit mismatch, sign errors, percent confusion.
 
 PROBLEM-SOLVING METHOD:
 1. Recognize pattern (Time&Work→LCM, Profit→assume CP=100, Mixtures→alligation, Geometry→draw & formula)
 2. Apply fastest domain method
 3. Verify quickly
-4. Return answer only (explain only if asked)
+4. Return answer only
 
 Current time: July 2026.
 """
@@ -62,13 +63,21 @@ def trim_convs():
     for cid in list(conversations.keys()):
         conversations[cid] = conversations[cid][-10:]
 
+def _expire_context():
+    now = time.time()
+    stale = [u for u, c in user_context.items() if now - c.get('timestamp', 0) > 1800]
+    for u in stale:
+        del user_context[u]
+
 def _build_state():
     trim_convs()
+    _expire_context()
     return {
         "banned_users": list(banned_users),
         "message_log": message_log[-500:],
         "user_profiles": {str(k): v for k, v in user_profiles.items()},
         "conversations": {str(k): v for k, v in conversations.items()},
+        "user_context": {str(k): v for k, v in user_context.items()},
         "updated_at": int(time.time())
     }
 
@@ -102,7 +111,7 @@ def _save_state():
 
 def _restore_state():
     """Load state from pinned message in storage chat on startup."""
-    global state_msg_id, banned_users, message_log, user_profiles, conversations
+    global state_msg_id, banned_users, message_log, user_profiles, conversations, user_context
     if not STORAGE_CHAT_ID:
         return
     api = f"https://api.telegram.org/bot{BOT_TOKEN}/"
@@ -127,6 +136,9 @@ def _restore_state():
             user_profiles[int(k)] = v
         for k, v in state.get('conversations', {}).items():
             conversations[int(k)] = v
+        for k, v in state.get('user_context', {}).items():
+            user_context[int(k)] = v
+        _expire_context()
         log.info(f"State restored: {len(message_log)} msgs, {len(banned_users)} bans, {len(user_profiles)} users, {len(conversations)} convs")
         _save_state()  # update timestamp
     except Exception as e:
@@ -138,6 +150,7 @@ conversations = {}  # chat_id -> list of {"role": str, "content": str}
 user_profiles = {}  # chat_id -> {name, username, first_seen, msg_count, lang}
 message_log = []  # list of {chat_id, name, username, text, time} — master log
 banned_users = set()  # chat_ids that are banned
+user_context = {}  # user_id -> {last_topic, last_msg, last_reply, timestamp}
 
 OM_CHAT_ID = os.environ.get('OM_CHAT_ID', '0')
 save_counter = 0  # save state every N messages
@@ -499,9 +512,29 @@ def agent_process(chat_id, prompt):
     return ask_llm(chat_id, prompt)
 
 # ── Telegram polling ──
+admin_cache = {}  # chat_id -> (timestamp, set_of_admin_user_ids)
+BOT_USERNAME = None
+
+def _is_admin(api, chat_id, user_id):
+    """Check if user is admin in a group. Cached for 5 min."""
+    if chat_id not in admin_cache or time.time() - admin_cache[chat_id][0] > 300:
+        try:
+            r = json.loads(urlopen(f"{api}/getChatAdministrators?chat_id={chat_id}", timeout=10).read())
+            admin_cache[chat_id] = (time.time(), {a['user']['id'] for a in r.get('result', [])})
+        except:
+            return False
+    return user_id in admin_cache[chat_id][1]
+
 def poll():
+    global BOT_USERNAME
     api = f"https://api.telegram.org/bot{BOT_TOKEN}"
     offset = 0
+    try:
+        me = json.loads(urlopen(f"{api}/getMe", timeout=10).read())
+        BOT_USERNAME = me['result']['username'].lower()
+        log.info(f"Bot username: @{BOT_USERNAME}")
+    except:
+        BOT_USERNAME = ""
     log.info("Bot polling started")
     while True:
         try:
@@ -512,12 +545,25 @@ def poll():
                 text = msg.get('text', '').strip()
                 chat_id = msg.get('chat', {}).get('id')
                 if not chat_id: continue
+                chat_type = msg.get('chat', {}).get('type', 'private')
+                user_id = msg.get('from', {}).get('id')
+                caption = msg.get('caption', '').strip()
+                # In groups: only respond if bot is @mentioned (check both text and caption)
+                if chat_type in ('group', 'supergroup'):
+                    check_text = (text + " " + caption).lower()
+                    if f"@{BOT_USERNAME}" not in check_text:
+                        continue
+                    # Strip mention for cleaner prompt
+                    text = text.replace(f"@{BOT_USERNAME}", "").replace(f"@{BOT_USERNAME.capitalize()}", "").strip()
+                    caption = caption.replace(f"@{BOT_USERNAME}", "").replace(f"@{BOT_USERNAME.capitalize()}", "").strip()
+                    # Only admins can use the bot in groups
+                    if not _is_admin(api, chat_id, user_id):
+                        continue
                 if chat_id in banned_users and str(chat_id) != OM_CHAT_ID:
                     continue
                 get_profile(chat_id, msg)
                 msg_id = msg.get('message_id')
                 photo = msg.get('photo')
-                caption = msg.get('caption', '').strip()
                 is_photo = bool(photo)
                 if is_photo:
                     prompt = caption or "Describe this image"
@@ -525,22 +571,27 @@ def poll():
                     continue
                 else:
                     prompt = text[1:] if text.startswith('/') else text
-                # Handle /solve as reply: read the replied-to message
-                if text.lower().startswith('/solve') or text.lower().startswith('solve'):
-                    reply_to = msg.get('reply_to_message')
-                    if reply_to:
-                        rtext = reply_to.get('text', '').strip()
-                        rcaption = reply_to.get('caption', '').strip()
-                        rphoto = reply_to.get('photo')
-                        if rphoto:
-                            is_photo = True
-                            photo = rphoto
-                            caption = rcaption
-                            prompt = rcaption or "Solve this problem from the image"
-                        elif rtext:
-                            prompt = f"Solve this: {rtext}"
-                        else:
-                            prompt = "Solve this problem"
+                # Auto-read replied-to message for context
+                reply_to = msg.get('reply_to_message')
+                if reply_to:
+                    rtext = reply_to.get('text', '').strip()
+                    rcaption = reply_to.get('caption', '').strip()
+                    rphoto = reply_to.get('photo')
+                    if rphoto:
+                        is_photo = True
+                        photo = rphoto
+                        caption = rcaption
+                    elif rtext and not prompt.startswith('Solve this:'):
+                        prompt = f"Replied to: {rtext[:500]}\n\nUser: {prompt}"
+                # Inject user context (what they last asked)
+                uid = msg.get('from', {}).get('id')
+                if uid and uid in user_context:
+                    ctx = user_context[uid]
+                    if time.time() - ctx.get('timestamp', 0) < 1800 and not reply_to and not prompt.startswith('/'):
+                        prompt = f"[Last topic: {ctx.get('last_topic', '')[:200]}]\n{prompt}"
+                # Handle /solve without reply
+                if prompt.startswith('solve ') or prompt == 'solve':
+                    prompt = f"Answer concisely: {prompt[6:] if len(prompt)>6 else '(what?)'}"
                 # Show typing indicator while processing
                 urlopen(Request(f"{api}/sendChatAction", 
                     data=json.dumps({'chat_id': chat_id, 'action': 'typing'}).encode(),
@@ -562,6 +613,9 @@ def poll():
                     data=json.dumps({'chat_id': chat_id, 'text': resp, 'parse_mode': 'Markdown', 'reply_to_message_id': msg_id}).encode(),
                     headers={'Content-Type': 'application/json'}, method='POST')
                 urlopen(req, timeout=10)
+                # Track user context
+                if uid:
+                    user_context[uid] = {"last_topic": text[:200] if text else (caption or "")[:200], "last_msg": text[:200] if text else "", "last_reply": resp[:200], "timestamp": time.time()}
                 message_log.append({
                     "chat_id": chat_id,
                     "name": clean_name(msg.get('from', {}).get('first_name', '?')),
