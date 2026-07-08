@@ -110,11 +110,23 @@ def _load(p):
         with open(os.path.join(BASE, p)) as f: return json.load(f)
     except: return {}
 
+def clean_name(raw):
+    """Strip invisible/control chars from names."""
+    import unicodedata
+    cleaned = []
+    for ch in raw:
+        cat = unicodedata.category(ch)
+        if cat == 'Cf' or (cat.startswith('C') and cat != 'Cs'):
+            continue
+        cleaned.append(ch)
+    return ''.join(cleaned).strip() or 'User'
+
 def get_profile(chat_id, msg):
     """Create or update user profile from message."""
+    raw_name = msg.get('from', {}).get('first_name', 'Unknown')
     if chat_id not in user_profiles:
         user_profiles[chat_id] = {
-            "name": msg.get('from', {}).get('first_name', 'Unknown'),
+            "name": clean_name(raw_name),
             "username": msg.get('from', {}).get('username', ''),
             "first_seen": int(time.time()),
             "msg_count": 0,
@@ -122,6 +134,7 @@ def get_profile(chat_id, msg):
             "chat_id": chat_id
         }
     p = user_profiles[chat_id]
+    p["name"] = clean_name(raw_name)
     p["msg_count"] += 1
     p["last_seen"] = int(time.time())
     return p
@@ -358,13 +371,15 @@ def poll():
                 msg = upd.get('message', {})
                 text = msg.get('text', '').strip()
                 chat_id = msg.get('chat', {}).get('id')
-                if not text or not chat_id: continue
+                if not chat_id: continue
+                if not text:
+                    continue  # skip non-text messages (photos, stickers, etc.)
                 if chat_id in banned_users and str(chat_id) != OM_CHAT_ID:
                     continue
                 get_profile(chat_id, msg)
                 message_log.append({
                     "chat_id": chat_id,
-                    "name": msg.get('from', {}).get('first_name', '?'),
+                    "name": clean_name(msg.get('from', {}).get('first_name', '?')),
                     "username": msg.get('from', {}).get('username', ''),
                     "text": text[:300],
                     "time": int(time.time())
