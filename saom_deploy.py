@@ -24,6 +24,12 @@ Om lives in India and has been building you since July 2026. He built you with: 
 
 You are helpful, precise, and occasionally witty. You use proper markdown formatting in responses. You are honest about your capabilities and limitations. When you don't know something, you say so. You take pride in your work and enjoy discussing AI, systems design, and problem-solving.
 
+FORMATTING RULES:
+- NEVER use LaTeX (\( \), $$, \[ \]) — Telegram can't render it.
+- For math, use Unicode symbols: × ÷ ≠ √ ² ³ ½ ¼ → ∠ △ ⟂ ≡ ≈ ∞ ∴
+- Use `^` for exponents (x² -> x^2) only if Unicode is unavailable.
+- Use separate lines for equations. Keep it clean and readable.
+
 Current time: July 2026.
 """
 
@@ -371,7 +377,7 @@ def agent_process(chat_id, prompt):
                     try:
                         img_req = Request(img_url, headers={'User-Agent': 'Mozilla/5.0'})
                         img_data = urlopen(img_req, timeout=20).read()
-                        return ask_llm_vision(chat_id, f"Read all text in this image. Format math clearly with Unicode symbols (×, ÷, ≠, √, ², ³, ½, →, ∠, △, ⟂). Use separate lines for equations. No LaTeX. User's request: {prompt}", img_data, caption=text)
+                        return ask_llm_vision(chat_id, f"Read all text in this image. Format math clearly with Unicode symbols (×, ÷, ≠, √, ², ³, ½, →, ∠, △, ⟂). Use separate lines for equations. NEVER use LaTeX (no \(, no $, no backslash). User's request: {prompt}", img_data, caption=text)
                     except Exception as e:
                         return f"Could not download image from Telegram: {e}"
                 if doc_urls:
@@ -486,7 +492,7 @@ def poll():
                         fr = json.loads(urlopen(f"{api}/getFile?file_id={file_id}", timeout=10).read())
                         fpath = fr['result']['file_path']
                         img_data = urlopen(f"{api.replace('/bot', '/file/bot')}/{fpath}", timeout=20).read()
-                        resp = ask_llm_vision(chat_id, f"Read all text in this image. Format math clearly with Unicode symbols (×, ÷, ≠, √, ², ³, ½, →, ∠, △, ⟂). Use separate lines for equations. No LaTeX. User's request: {prompt}", img_data, caption=caption)
+                        resp = ask_llm_vision(chat_id, f"Read all text in this image. Format math clearly with Unicode symbols (×, ÷, ≠, √, ², ³, ½, →, ∠, △, ⟂). Use separate lines for equations. NEVER use LaTeX (no \(, no $, no backslash). User's request: {prompt}", img_data, caption=caption)
                         message_log.append({
                             "chat_id": chat_id, "name": clean_name(msg.get('from',{}).get('first_name','?')),
                             "username": msg.get('from',{}).get('username',''),
