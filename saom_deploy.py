@@ -5,7 +5,7 @@ import json, os, sys, threading, time, logging, re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.request import Request, urlopen
 
-CODE_DIR = os.path.dirname(os.path.abspath(__file__))
+CODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASE = os.path.join(CODE_DIR, '.opencode', 'skills', 'saom', 'memory')
 PORT = int(os.environ.get("PORT", 8080))
 BOT_TOKEN = os.environ.get("SAOM_BOT_TOKEN", "")
@@ -240,7 +240,7 @@ def agent_process(chat_id, prompt):
                 f"- First seen: <code>{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(p.get('first_seen', 0)))}</code>")
 
     # Ban/unban - Om only
-    if prompt.startswith('/ban ') and str(chat_id) == OM_CHAT_ID:
+    if (prompt.startswith('ban ') or prompt.startswith('/ban ')) and str(chat_id) == OM_CHAT_ID:
         parts = prompt.split()
         if len(parts) < 2:
             return "Usage: /ban <chat_id>"
@@ -252,7 +252,7 @@ def agent_process(chat_id, prompt):
         except ValueError:
             return "Invalid chat_id. Must be a number."
 
-    if prompt.startswith('/unban ') and str(chat_id) == OM_CHAT_ID:
+    if (prompt.startswith('unban ') or prompt.startswith('/unban ')) and str(chat_id) == OM_CHAT_ID:
         parts = prompt.split()
         if len(parts) < 2:
             return "Usage: /unban <chat_id>"
@@ -274,7 +274,7 @@ def agent_process(chat_id, prompt):
         return '\n'.join(lines)
 
     # Webhook / talk to other bots
-    if prompt.startswith('/webhook ') or prompt.startswith('/wh '):
+    if prompt.startswith('webhook ') or prompt.startswith('/webhook ') or prompt.startswith('wh ') or prompt.startswith('/wh '):
         parts = prompt.split(maxsplit=2)
         if len(parts) < 3:
             return "Usage: /webhook <url> <json_body>"
@@ -290,7 +290,7 @@ def agent_process(chat_id, prompt):
         except Exception as e:
             return f"Webhook error: {e}"
 
-    if prompt.startswith('/get ') or prompt.startswith('/fetch '):
+    if prompt.startswith('get ') or prompt.startswith('/get ') or prompt.startswith('fetch ') or prompt.startswith('/fetch '):
         url = prompt.split(maxsplit=1)[1]
         try:
             req = Request(url, headers={'User-Agent': 'SAOM-bot/1.0'})
@@ -300,7 +300,7 @@ def agent_process(chat_id, prompt):
             return f"Fetch error: {e}"
 
     # Master user log - restricted to Om only
-    if pl in ('/userlog', '/userlog ', '/ul') and str(chat_id) == OM_CHAT_ID:
+    if pl in ('userlog', '/userlog', 'ul') and str(chat_id) == OM_CHAT_ID:
         if not message_log:
             return "No messages logged yet."
         users = {}
@@ -317,7 +317,7 @@ def agent_process(chat_id, prompt):
             lines.append(f"`{cid}` | {u['name']} @{u['username']} | {u['count']} msgs | {first} -> {last}")
         return '\n'.join(lines)
 
-    if prompt.startswith('/userlogcsv') and str(chat_id) == OM_CHAT_ID:
+    if prompt.startswith('userlogcsv') and str(chat_id) == OM_CHAT_ID:
         if not message_log:
             return "No messages logged yet."
         import csv, io
@@ -333,7 +333,7 @@ def agent_process(chat_id, prompt):
         return f"CSV exported ({len(message_log)} messages). Check the file above."
 
     # Shell exec - restricted to Om only
-    if (prompt.startswith('/exec ') or prompt.startswith('/run ')) and str(chat_id) == OM_CHAT_ID:
+    if (prompt.startswith('exec ') or prompt.startswith('/exec ') or prompt.startswith('run ') or prompt.startswith('/run ')) and str(chat_id) == OM_CHAT_ID:
         cmd = prompt.split(maxsplit=1)[1]
         import subprocess
         try:
