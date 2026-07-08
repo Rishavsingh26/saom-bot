@@ -36,10 +36,23 @@ Om lives in India and has been building you since July 2026. He built you with: 
 
 You are helpful, precise, and occasionally witty. You use proper markdown formatting in responses. You are honest about your capabilities and limitations. When you don't know something, you say so. You take pride in your work and enjoy discussing AI, systems design, and problem-solving.
 
-MATH: Just equations/values. No words. No steps. Hinglish OK. Answer last line.
-Never LaTeX. Use Unicode: × ÷ ≠ √ ² ³ ½ ¼ → ∠ △ ⟂ ≡ ≈ ∞ ∴ ° ∆ π
+LEARNED PREFERENCES (from past corrections — follow these always):
 
-For non-math: ALWAYS respond BRIEFLY — short answer, one line max. Full detail only if user says "explain", "how", "steps", or "detail".
+MATH answers:
+- ALWAYS output ONLY 3-7 equation lines. Never prose, never reasoning.
+- One equation per line showing intermediate steps
+- Final answer on the LAST line
+- No LaTeX. Use Unicode: × ÷ ≠ √ ² ³ ½ ¼ → ≈ ∴ °
+- Hinglish (Hindi mix) allowed
+- Example:
+  Up = 6, Down = 10
+  Boat = (10+6)/2 = 8
+  Stream = (10-6)/2 = 2
+  B:C = 2:1 ✅
+
+NON-MATH answers:
+- Default: output ONLY 1-4 lines, no prose
+- Full detail/prose only if user says "explain", "how", "steps", or "detail"
 
 Current time: July 2026.
 """
@@ -211,7 +224,7 @@ def ask_llm(chat_id, user_msg):
     if is_math:
         concise_msg = "Answer with short equation-lines showing working. One equation per line. Answer on last line. 3 lines min, 7 lines max. No LaTeX.\n\n" + user_msg
     else:
-        concise_msg = "Answer concisely. 1-2 lines max. No LaTeX.\n\n" + user_msg
+        concise_msg = "Answer concisely. 1-4 lines. No LaTeX.\n\n" + user_msg
     messages.append({"role": "user", "content": concise_msg})
     body = json.dumps({
         "model": MODEL,
@@ -251,7 +264,7 @@ def ask_llm_vision(chat_id, prompt, image_data, caption=""):
     if is_math:
         vision_prompt = "Answer with short equation-lines showing working. One equation per line. Answer on last line. 3 lines min, 7 lines max. No LaTeX.\n\n" + prompt
     else:
-        vision_prompt = "Answer concisely. 1-2 lines max. No LaTeX.\n\n" + prompt
+        vision_prompt = "Answer concisely. 1-4 lines. No LaTeX.\n\n" + prompt
     content = []
     if caption:
         content.append({"type": "text", "text": f"Caption: {caption}"})
