@@ -41,8 +41,9 @@ You are helpful, precise, and occasionally witty. You use proper markdown format
 FORMATTING RULES:
 - NEVER use LaTeX (\( \), $$, \[ \]) — Telegram can't render it.
 - For math, use Unicode symbols: × ÷ ≠ √ ² ³ ½ ¼ → ∠ △ ⟂ ≡ ≈ ∞ ∴
-- Use `^` for exponents (x² -> x^2) only if Unicode is unavailable.
-- Use separate lines for equations. Keep it clean and readable.
+- Use `^` for exponents only if Unicode unavailable.
+- Use separate lines for equations.
+- BE CONCISE: No full-sentence explanations, no "Step 1:" headers, no "we can calculate" fluff. Just equations, values, and the answer. Only explain if asked.
 
 Current time: July 2026.
 """
@@ -50,11 +51,18 @@ Current time: July 2026.
 # ── Telegram-based database (state persists via pinned message) ──
 state_msg_id = None  # message_id of the pinned state message
 
+def trim_convs():
+    """Trim conversations to last 5 exchanges per chat."""
+    for cid in list(conversations.keys()):
+        conversations[cid] = conversations[cid][-10:]
+
 def _build_state():
+    trim_convs()
     return {
         "banned_users": list(banned_users),
         "message_log": message_log[-500:],
         "user_profiles": {str(k): v for k, v in user_profiles.items()},
+        "conversations": {str(k): v for k, v in conversations.items()},
         "updated_at": int(time.time())
     }
 
@@ -88,7 +96,7 @@ def _save_state():
 
 def _restore_state():
     """Load state from pinned message in storage chat on startup."""
-    global state_msg_id, banned_users, message_log, user_profiles
+    global state_msg_id, banned_users, message_log, user_profiles, conversations
     if not STORAGE_CHAT_ID:
         return
     api = f"https://api.telegram.org/bot{BOT_TOKEN}/"
@@ -111,7 +119,9 @@ def _restore_state():
         message_log = state.get('message_log', [])
         for k, v in state.get('user_profiles', {}).items():
             user_profiles[int(k)] = v
-        log.info(f"State restored: {len(message_log)} msgs, {len(banned_users)} bans, {len(user_profiles)} users")
+        for k, v in state.get('conversations', {}).items():
+            conversations[int(k)] = v
+        log.info(f"State restored: {len(message_log)} msgs, {len(banned_users)} bans, {len(user_profiles)} users, {len(conversations)} convs")
         _save_state()  # update timestamp
     except Exception as e:
         log.warning(f"State restore failed: {e}")
@@ -499,52 +509,47 @@ def poll():
                 if chat_id in banned_users and str(chat_id) != OM_CHAT_ID:
                     continue
                 get_profile(chat_id, msg)
+                msg_id = msg.get('message_id')
                 photo = msg.get('photo')
                 caption = msg.get('caption', '').strip()
-                if photo:
-                    file_id = photo[-1]['file_id']
+                is_photo = bool(photo)
+                if is_photo:
                     prompt = caption or "Describe this image"
+                elif not text:
+                    continue
+                else:
+                    prompt = text[1:] if text.startswith('/') else text
+                # Show typing indicator while processing
+                urlopen(Request(f"{api}/sendChatAction", 
+                    data=json.dumps({'chat_id': chat_id, 'action': 'typing'}).encode(),
+                    headers={'Content-Type': 'application/json'}, method='POST'), timeout=5)
+                if is_photo:
+                    file_id = photo[-1]['file_id']
                     try:
                         fr = json.loads(urlopen(f"{api}/getFile?file_id={file_id}", timeout=10).read())
                         fpath = fr['result']['file_path']
                         img_data = urlopen(f"{api.replace('/bot', '/file/bot')}/{fpath}", timeout=20).read()
                         resp = ask_llm_vision(chat_id, f"Read all text in this image. If the image has Hindi/Devanagari text, read and preserve it exactly. Format math with Unicode (×, ÷, ≠, √, ², ³, ½, →, ∠, △, ⟂). Separate lines for equations. NEVER use LaTeX (no \(, no $, no backslash). User's request: {prompt}", img_data, caption=caption)
-                        message_log.append({
-                            "chat_id": chat_id, "name": clean_name(msg.get('from',{}).get('first_name','?')),
-                            "username": msg.get('from',{}).get('username',''),
-                            "text": f"[Photo] {caption[:200]}" if caption else "[Photo]",
-                            "time": int(time.time())
-                        })
                     except Exception as e:
                         resp = f"Error processing image: {e}"
-                    req = Request(f"{api}/sendMessage",
-                        data=json.dumps({'chat_id': chat_id, 'text': resp, 'parse_mode': 'Markdown'}).encode(),
-                        headers={'Content-Type': 'application/json'}, method='POST')
-                    urlopen(req, timeout=10)
-                    global save_counter
-                    save_counter += 1
-                    if save_counter % 10 == 0:
-                        _save_state()
-                    continue
-                if not text:
-                    continue  # skip other non-text messages (stickers, voice, etc.)
+                else:
+                    log.info(f"From {chat_id} ({user_profiles[chat_id]['name']}): {prompt[:60]}")
+                    resp = agent_process(chat_id, prompt)
+                # Send response as reply to original message
+                req = Request(f"{api}/sendMessage",
+                    data=json.dumps({'chat_id': chat_id, 'text': resp, 'parse_mode': 'Markdown', 'reply_to_message_id': msg_id}).encode(),
+                    headers={'Content-Type': 'application/json'}, method='POST')
+                urlopen(req, timeout=10)
                 message_log.append({
                     "chat_id": chat_id,
                     "name": clean_name(msg.get('from', {}).get('first_name', '?')),
                     "username": msg.get('from', {}).get('username', ''),
-                    "text": text[:300],
+                    "text": (f"[Photo] {caption[:200]}" if is_photo else text)[:300],
                     "time": int(time.time())
                 })
-                prompt = text[1:] if text.startswith('/') else text
-                log.info(f"From {chat_id} ({user_profiles[chat_id]['name']}): {prompt[:60]}")
-                resp = agent_process(chat_id, prompt)
-                req = Request(f"{api}/sendMessage",
-                    data=json.dumps({'chat_id': chat_id, 'text': resp, 'parse_mode': 'Markdown'}).encode(),
-                    headers={'Content-Type': 'application/json'},
-                    method='POST')
-                urlopen(req, timeout=10)
+                global save_counter
                 save_counter += 1
-                if save_counter % 10 == 0 or save_counter == 1:
+                if save_counter % 10 == 0:
                     _save_state()
         except Exception as e:
             log.error(f"Poll error: {e}")
