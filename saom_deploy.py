@@ -1,35 +1,32 @@
 #!/usr/bin/env python3
 """SAOM — single-process Telegram bot for cloud deployment.
-Listens on $PORT for platform health checks, polls Telegram, answers via Groq."""
+Includes SAOM tools (stats, lessons, version, health)."""
 import json, os, sys, threading, time, logging
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.request import Request, urlopen
 
 CODE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(CODE_DIR, "saom_config.json")
+BASE = os.path.join(CODE_DIR, '.opencode', 'skills', 'saom', 'memory')
 PORT = int(os.environ.get("PORT", 8080))
 BOT_TOKEN = os.environ.get("SAOM_BOT_TOKEN", "")
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
 
-# Fallback to config file
-if not GROQ_KEY and os.path.exists(CONFIG_PATH):
-    with open(CONFIG_PATH) as f:
-        c = json.load(f)
-    g = c.get('providers', {}).get('groq', {})
-    GROQ_KEY = g.get('api_key', '')
-    MODEL = g.get('model', MODEL)
-
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 log = logging.getLogger('saom')
+
+# ── SAOM memory helpers ──
+def _load(p):
+    try:
+        with open(os.path.join(BASE, p)) as f: return json.load(f)
+    except: return {}
 
 # ── LLM ──
 def ask_llm(prompt):
     body = json.dumps({
         "model": MODEL,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 1024,
-        "temperature": 0.7
+        "max_tokens": 1024, "temperature": 0.7
     }).encode()
     req = Request("https://api.groq.com/openai/v1/chat/completions",
                   data=body,
@@ -37,10 +34,40 @@ def ask_llm(prompt):
                            "User-Agent": "Mozilla/5.0 (compatible; SAOM-bot/1.0)"},
                   method="POST")
     try:
-        resp = json.loads(urlopen(req, timeout=30).read())
-        return resp['choices'][0]['message']['content'].strip()
+        return json.loads(urlopen(req, timeout=30).read())['choices'][0]['message']['content'].strip()
     except Exception as e:
         return f"LLM error: {e}"
+
+# ── SAOM tools ──
+def agent_process(prompt):
+    prompt = prompt.strip()
+    if not prompt: return "Say something!"
+    pl = prompt.lower()
+
+    if pl in ('health', '/health', '/h'):
+        return "SAOM is healthy and running on Render!"
+    if pl in ('stats', '/stats', '/st'):
+        init = _load('init.json')
+        ms = init.get('memory_stats', {})
+        skills = init.get('loaded_skills', [])
+        return (f"SAOM v{init.get('version','?')} | {init.get('session_count',0)} sessions | "
+                f"{ms.get('graph_nodes',0)}n/{ms.get('graph_edges',0)}e | "
+                f"{len(skills)} skills | {init.get('tools_count',0)} tools")
+    if pl in ('version', '/version', '/v'):
+        return f"SAOM v{_load('init.json').get('version','?')}"
+    if pl in ('help', '/help', '/start'):
+        return ("SAOM Agent on Render -- Super Agent Om\n"
+                "Commands: health, stats, version\n"
+                "Or just ask me anything!")
+
+    mem_terms = ['memory', 'session', 'log', 'state', 'what can you do', 'who are you']
+    if any(t in pl for t in mem_terms) and len(pl) < 60:
+        init = _load('init.json')
+        ms = init.get('memory_stats', {})
+        return (f"SAOM v{init.get('version','?')}, {init.get('session_count',0)} sessions, "
+                f"{ms.get('graph_nodes',0)} nodes.\nI'm a helpful AI. Ask me anything!")
+
+    return ask_llm(prompt)
 
 # ── Telegram polling ──
 def poll():
@@ -55,11 +82,10 @@ def poll():
                 msg = upd.get('message', {})
                 text = msg.get('text', '').strip()
                 chat_id = msg.get('chat', {}).get('id')
-                if not text or not chat_id:
-                    continue
+                if not text or not chat_id: continue
                 prompt = text[1:] if text.startswith('/') else text
                 log.info(f"From {chat_id}: {prompt[:60]}")
-                resp = ask_llm(prompt)
+                resp = agent_process(prompt)
                 req = Request(f"{api}/sendMessage",
                     data=json.dumps({'chat_id': chat_id, 'text': resp}).encode(),
                     headers={'Content-Type': 'application/json'},
@@ -79,7 +105,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
 def main():
-    log.info(f"SAOM starting | port={PORT} | model={MODEL} | key={'set' if GROQ_KEY else 'MISSING'}")
+    log.info(f"SAOM starting | port={PORT} | model={MODEL}")
     if not BOT_TOKEN or not GROQ_KEY:
         log.error("Missing BOT_TOKEN or GROQ_KEY")
         sys.exit(1)
