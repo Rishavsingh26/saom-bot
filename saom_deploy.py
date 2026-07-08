@@ -59,8 +59,11 @@ def poll():
                 prompt = text[1:] if text.startswith('/') else text
                 log.info(f"From {chat_id}: {prompt[:60]}")
                 resp = ask_llm(prompt)
-                data = json.dumps({'chat_id': chat_id, 'text': resp}).encode()
-                urlopen(f"{api}/sendMessage", data=data, timeout=10)
+                req = Request(f"{api}/sendMessage",
+                    data=json.dumps({'chat_id': chat_id, 'text': resp}).encode(),
+                    headers={'Content-Type': 'application/json'},
+                    method='POST')
+                urlopen(req, timeout=10)
         except Exception as e:
             log.error(f"Poll error: {e}")
             time.sleep(5)
