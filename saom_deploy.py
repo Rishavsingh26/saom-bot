@@ -11,6 +11,7 @@ PORT = int(os.environ.get("PORT", 8080))
 BOT_TOKEN = os.environ.get("SAOM_BOT_TOKEN", "")
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "llama-3.2-11b-vision-preview")
 STORAGE_CHAT_ID = os.environ.get("STORAGE_CHAT_ID", "")  # private group for persistent state
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
@@ -166,6 +167,35 @@ def ask_llm(chat_id, user_msg):
     except Exception as e:
         return f"LLM error: {e}"
 
+def ask_llm_vision(chat_id, prompt, image_data, caption=""):
+    """Send prompt + image to Groq vision model."""
+    import base64
+    b64 = base64.b64encode(image_data).decode()
+    ext = "image/jpeg"
+    content = []
+    if caption:
+        content.append({"type": "text", "text": f"Caption: {caption}"})
+    content.append({"type": "text", "text": prompt})
+    content.append({"type": "image_url", "image_url": {"url": f"data:{ext};base64,{b64}"}})
+    body = json.dumps({
+        "model": VISION_MODEL,
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": 2048, "temperature": 0.7
+    }).encode()
+    req = Request("https://api.groq.com/openai/v1/chat/completions",
+                  data=body,
+                  headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json",
+                           "User-Agent": "Mozilla/5.0 (compatible; SAOM-bot/1.0)"},
+                  method="POST")
+    try:
+        resp = json.loads(urlopen(req, timeout=60).read())['choices'][0]['message']['content'].strip()
+        if chat_id in conversations:
+            conversations[chat_id].append({"role": "user", "content": f"[Image analysis] {prompt[:100]}"})
+            conversations[chat_id].append({"role": "assistant", "content": resp})
+        return resp
+    except Exception as e:
+        return f"Vision LLM error: {e}"
+
 # ── SAOM tools ──
 def send_document(chat_id, file_bytes, filename):
     """Send a file to Telegram chat."""
@@ -303,6 +333,70 @@ def agent_process(chat_id, prompt):
         except Exception as e:
             return f"Webhook error: {e}"
 
+    # ── Telegram link reader ──
+    tg_match = re.search(r'(?:https?://)?(?:t\.me|telegram\.me)/(?:c/)?([a-zA-Z0-9_]+)(?:/(\d+))?', prompt)
+    if tg_match:
+        channel = tg_match.group(1)
+        msg_id = tg_match.group(2)
+        if msg_id:
+            try:
+                url = f"https://t.me/{channel}/{msg_id}?embed=1"
+                req = Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+                resp = urlopen(req, timeout=15).read().decode('utf-8', errors='replace')
+                text_match = re.search(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>\s*</div>', resp, re.DOTALL)
+                author_match = re.search(r'<div class="tgme_widget_message_author[^"]*"[^>]*>(.*?)</div>', resp, re.DOTALL)
+                author = re.sub(r'<[^>]+>', '', author_match.group(1)).strip() if author_match else f"@{channel}"
+                text = ""
+                if text_match:
+                    raw = text_match.group(1)
+                    raw = raw.replace('<br/>', '\n').replace('<br>', '\n').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>').replace('&quot;', '"').replace('&#39;', "'")
+                    text = re.sub(r'<[^>]+>', '', raw).strip()
+                content_parts = [f"From {author}"]
+                if text:
+                    content_parts.append(text)
+                # Check for media (photo / document / video)
+                photo_urls = re.findall(r'background-image:url\([ "\']+(https?://[^"\' )]+)[ "\']+\)', resp)
+                doc_urls = re.findall(r'class="tgme_widget_message_download"[^>]*href="(https?://[^"]+)"', resp)
+                video_urls = re.findall(r'<video[^>]*src="(https?://[^"]+)"', resp)
+                if photo_urls:
+                    img_url = photo_urls[0].replace('&amp;', '&')
+                    try:
+                        img_req = Request(img_url, headers={'User-Agent': 'Mozilla/5.0'})
+                        img_data = urlopen(img_req, timeout=20).read()
+                        return ask_llm_vision(chat_id, f"Analyze this image. User's request: {prompt}", img_data, caption=text)
+                    except Exception as e:
+                        return f"Could not download image from Telegram: {e}"
+                if doc_urls:
+                    doc_url = doc_urls[0].replace('&amp;', '&')
+                    doc_name_match = re.search(r'<div class="tgme_widget_message_document_title">([^<]+)</div>', resp)
+                    doc_name = doc_name_match.group(1).strip() if doc_name_match else "document"
+                    content_parts.append(f"[File: {doc_name}]")
+                    if doc_name.lower().endswith('.pdf'):
+                        try:
+                            import pdfplumber
+                            import io
+                            doc_req = Request(doc_url, headers={'User-Agent': 'Mozilla/5.0'})
+                            doc_data = urlopen(doc_req, timeout=30).read()
+                            with pdfplumber.open(io.BytesIO(doc_data)) as pdf:
+                                pdf_text = '\n'.join(page.extract_text() or '' for page in pdf.pages)
+                            if pdf_text.strip():
+                                content_parts.append("[PDF text content]: " + pdf_text.strip()[:3000])
+                            else:
+                                content_parts.append("[PDF contains no extractable text - may be scanned]")
+                        except Exception as e:
+                            content_parts.append(f"[Could not extract PDF text: {e}]")
+                    else:
+                        content_parts.append(f"[Direct download link: {doc_url}]")
+                if video_urls:
+                    content_parts.append("[This message contains a video - cannot process]")
+                if not text and not photo_urls and not doc_urls and not video_urls:
+                    return f"Could not extract any content from @{channel} #{msg_id}. The channel may be private or the message may contain unsupported media."
+                combined = '\n\n'.join(content_parts)
+                return ask_llm(chat_id, f"Here is a Telegram message content:\n\n{combined}\n\nUser asked: {prompt}")
+            except Exception as e:
+                return f"Error fetching Telegram message: {e}"
+        else:
+            return f"Telegram channel/profile: @{channel}. Use a specific message link like `t.me/{channel}/<message_id>` to read a message."
     if prompt.startswith('get ') or prompt.startswith('/get ') or prompt.startswith('fetch ') or prompt.startswith('/fetch '):
         url = prompt.split(maxsplit=1)[1]
         try:
