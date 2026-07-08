@@ -17,9 +17,23 @@ STORAGE_CHAT_ID = os.environ.get("STORAGE_CHAT_ID", "")  # private group for per
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 log = logging.getLogger('saom')
 
+GREEK_MAP = {
+    'alpha': '\u03b1', 'beta': '\u03b2', 'gamma': '\u03b3', 'delta': '\u03b4',
+    'epsilon': '\u03b5', 'zeta': '\u03b6', 'eta': '\u03b7', 'theta': '\u03b8',
+    'iota': '\u03b9', 'kappa': '\u03ba', 'lambda': '\u03bb', 'mu': '\u03bc',
+    'nu': '\u03bd', 'xi': '\u03be', 'omicron': '\u03bf', 'pi': '\u03c0',
+    'rho': '\u03c1', 'sigma': '\u03c3', 'tau': '\u03c4', 'upsilon': '\u03c5',
+    'phi': '\u03c6', 'chi': '\u03c7', 'psi': '\u03c8', 'omega': '\u03c9',
+    'Alpha': '\u0391', 'Beta': '\u0392', 'Gamma': '\u0393', 'Delta': '\u0394',
+    'Theta': '\u0398', 'Lambda': '\u039b', 'Pi': '\u03a0', 'Sigma': '\u03a3',
+    'Phi': '\u03a6', 'Omega': '\u03a9',
+}
+
 def strip_latex(text):
-    """Remove LaTeX - Telegram can't render it. Preserves newlines."""
+    """Remove LaTeX - Telegram can't render it. Preserves Greek letters as Unicode."""
     text = re.sub(r'\\frac\{([^}]*)\}\{([^}]*)\}', r'\1/\2', text)
+    for greek, char in GREEK_MAP.items():
+        text = re.sub(rf'\\{greek}(?![a-zA-Z])', char, text)
     text = re.sub(r'\\[a-zA-Z]+\{([^}]*)\}', r'\1', text)
     text = re.sub(r'\\[\(\)\[\]]', '', text)
     text = re.sub(r'\\[a-zA-Z]+', '', text)
@@ -39,19 +53,20 @@ You are helpful, precise, and occasionally witty. You use proper markdown format
 LEARNED PREFERENCES (from past corrections — follow these always):
 
 MATH answers:
-- ALWAYS output ONLY 3-7 equation lines. Never prose, never reasoning.
-- One equation per line showing intermediate steps
+- ALWAYS output ONLY 3-7 equation lines. Never prose, never reasoning, no "Step" headers.
+- One equation per line showing intermediate working
 - Final answer on the LAST line
-- No LaTeX. Use Unicode: × ÷ ≠ √ ² ³ ½ ¼ → ≈ ∴ °
+- No LaTeX. Use Unicode: × ÷ ≠ √ ² ³ ½ ¼ → ≈ ∴ ° α β γ θ π Σ
 - Hinglish (Hindi mix) allowed
 - Example:
   Up = 6, Down = 10
   Boat = (10+6)/2 = 8
   Stream = (10-6)/2 = 2
-  B:C = 2:1 ✅
+  B:C = 2:1
 
 NON-MATH answers:
-- Default: output ONLY 1-4 lines, no prose
+- Default: output ONLY 1-4 lines, concise prose
+- DO NOT use equation format for non-math questions
 - Full detail/prose only if user says "explain", "how", "steps", or "detail"
 
 Current time: July 2026.
@@ -76,7 +91,7 @@ def _build_state():
     _expire_context()
     return {
         "banned_users": list(banned_users),
-        "message_log": message_log[-500:],
+        "message_log": message_log[-1000:],
         "user_profiles": {str(k): v for k, v in user_profiles.items()},
         "conversations": {str(k): v for k, v in conversations.items()},
         "user_context": {str(k): v for k, v in user_context.items()},
@@ -215,21 +230,32 @@ def ask_llm(chat_id, user_msg):
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for h in history:
         messages.append(h)
-    # Math detection — only inject equation format for math queries
-    math_keywords = ['math', 'solve', 'find', 'calculate', '=?', '= ?', 'km', 'km/h', 'cm', 'm/s', 'ratio',
-                     'profit', 'loss', 'interest', 'speed', 'time', 'work', 'age', 'avg', 'area',
-                     'volume', 'perimeter', 'train', 'boat', 'stream', 'mixture', 'allegation',
-                     'number', 'digit', 'sum', 'difference', 'product', '%', '÷', '×', '+', '-', '/']
-    is_math = any(kw in user_msg.lower() for kw in math_keywords)
+    # Math detection — targeted keywords, exclude non-math question words
+    non_math_words = ['who', 'what is', 'what are', 'where', 'when', 'why', 'how', 'which',
+                      'who created', 'define', 'explain', 'tell me about', 'difference between']
+    is_non_math = any(kw in user_msg.lower() for kw in non_math_words)
+    math_keywords = ['math', 'solve', 'find', 'calculate', '=?', '= ?', 'km', 'km/h', 'cm', 'm/s',
+                     'ratio', 'profit', 'loss', 'interest', 'speed', 'time', 'work', 'age', 'avg',
+                     'area', 'volume', 'perimeter', 'train', 'boat', 'stream', 'mixture', 'allegation',
+                     'number', 'digit', 'sum', 'difference', 'product', 'divide', 'multiple',
+                     '%', '÷', '×', '=x', '=y']
+    is_math = any(kw in user_msg.lower() for kw in math_keywords) and not is_non_math
+    # Also check for number patterns like "A:B" or "9:13"
+    if not is_math and not is_non_math:
+        is_math = bool(re.search(r'\d+\s*:\s*\d+', user_msg))  # ratio pattern
     if is_math:
-        concise_msg = "Answer with short equation-lines showing working. One equation per line. Answer on last line. 3 lines min, 7 lines max. No LaTeX.\n\n" + user_msg
+        concise_msg = "Answer ONLY with 3-7 equation lines. One equation per line. Intermediate working shown. Final answer on last line. No LaTeX. No prose. No reasoning. JUST EQUATIONS.\n\n" + user_msg
+        temp = 0.2
+        maxtok = 512
     else:
         concise_msg = "Answer concisely. 1-4 lines. No LaTeX.\n\n" + user_msg
+        temp = 0.7
+        maxtok = 1024
     messages.append({"role": "user", "content": concise_msg})
     body = json.dumps({
         "model": MODEL,
         "messages": messages,
-        "max_tokens": 1024, "temperature": 0.7
+        "max_tokens": maxtok, "temperature": temp
     }).encode()
     req = Request("https://api.groq.com/openai/v1/chat/completions",
                   data=body,
@@ -258,13 +284,23 @@ def ask_llm_vision(chat_id, prompt, image_data, caption=""):
     else:
         mime = "image/jpeg"
     # Math detection for vision too
+    non_math_words = ['who', 'what is', 'what are', 'where', 'when', 'why', 'how', 'which',
+                      'who created', 'define', 'explain', 'tell me about', 'difference between']
+    is_non_math = any(kw in prompt.lower() for kw in non_math_words)
     math_keywords = ['math', 'solve', 'find', 'calculate', '=?', '= ?', 'km', 'ratio', 'profit', 'loss',
-                     'speed', 'time', 'work', 'area', 'volume', 'perimeter', 'sum', '%', '÷', '+', '-']
-    is_math = any(kw in prompt.lower() for kw in math_keywords)
+                     'speed', 'time', 'work', 'area', 'volume', 'perimeter', 'sum', 'divide',
+                     '%', '÷', '×', '=x', '=y']
+    is_math = any(kw in prompt.lower() for kw in math_keywords) and not is_non_math
+    if not is_math and not is_non_math:
+        is_math = bool(re.search(r'\d+\s*:\s*\d+', prompt))  # ratio pattern
     if is_math:
-        vision_prompt = "Answer with short equation-lines showing working. One equation per line. Answer on last line. 3 lines min, 7 lines max. No LaTeX.\n\n" + prompt
+        vision_prompt = "Answer ONLY with 3-7 equation lines. One equation per line. Intermediate working shown. Final answer on last line. No LaTeX. No prose. No reasoning. JUST EQUATIONS.\n\n" + prompt
+        vtemp = 0.2
+        vmaxtok = 1024
     else:
         vision_prompt = "Answer concisely. 1-4 lines. No LaTeX.\n\n" + prompt
+        vtemp = 0.3
+        vmaxtok = 4096
     content = []
     if caption:
         content.append({"type": "text", "text": f"Caption: {caption}"})
@@ -273,7 +309,7 @@ def ask_llm_vision(chat_id, prompt, image_data, caption=""):
     body = json.dumps({
         "model": VISION_MODEL,
         "messages": [{"role": "user", "content": content}],
-        "max_tokens": 4096, "temperature": 0.3
+        "max_tokens": vmaxtok, "temperature": vtemp
     }).encode()
     log.info(f"Vision request: model={VISION_MODEL}, caption={'yes' if caption else 'no'}, img_size={len(image_data)} bytes")
     req = Request("https://api.groq.com/openai/v1/chat/completions",
@@ -662,7 +698,16 @@ def poll():
                     "name": clean_name(msg.get('from', {}).get('first_name', '?')),
                     "username": msg.get('from', {}).get('username', ''),
                     "text": (f"[Photo] {caption[:200]}" if is_photo else text)[:300],
-                    "time": int(time.time())
+                    "time": int(time.time()),
+                    "role": "user"
+                })
+                message_log.append({
+                    "chat_id": chat_id,
+                    "name": "SAOM",
+                    "username": "",
+                    "text": resp[:300],
+                    "time": int(time.time()),
+                    "role": "bot"
                 })
                 global save_counter
                 save_counter += 1
