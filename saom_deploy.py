@@ -33,7 +33,8 @@ def ask_llm(prompt):
     }).encode()
     req = Request("https://api.groq.com/openai/v1/chat/completions",
                   data=body,
-                  headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+                  headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json",
+                           "User-Agent": "Mozilla/5.0 (compatible; SAOM-bot/1.0)"},
                   method="POST")
     try:
         resp = json.loads(urlopen(req, timeout=30).read())
