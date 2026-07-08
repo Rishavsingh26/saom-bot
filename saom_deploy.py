@@ -17,6 +17,20 @@ STORAGE_CHAT_ID = os.environ.get("STORAGE_CHAT_ID", "")  # private group for per
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 log = logging.getLogger('saom')
 
+def strip_latex(text):
+    """Remove LaTeX delimiters that Telegram can't render."""
+    text = re.sub(r'\$\\boxed\{([^}]*)\}\$', r'\1', text)
+    text = re.sub(r'\\boxed\{([^}]*)\}', r'\1', text)
+    text = re.sub(r'\$\$([^$]*)\$\$', r'\1', text)
+    text = re.sub(r'\$([^$]*)\$', r'\1', text)
+    text = re.sub(r'\\\(', '', text)
+    text = re.sub(r'\\\)', '', text)
+    text = re.sub(r'\\\[', '', text)
+    text = re.sub(r'\\\]', '', text)
+    text = re.sub(r'\\text\{([^}]*)\}', r'\1', text)
+    text = re.sub(r'\\frac\{([^}]*)\}\{([^}]*)\}', r'\1/\2', text)
+    return text.strip()
+
 # ── Persona ──
 SYSTEM_PROMPT = """You are SAOM (Super Agent Ouroboros Manager), a recursive self-improving AI agent created by Om. You run on Render and connect via Telegram.
 
@@ -167,6 +181,7 @@ def ask_llm(chat_id, user_msg):
                   method="POST")
     try:
         resp = json.loads(urlopen(req, timeout=30).read())['choices'][0]['message']['content'].strip()
+        resp = strip_latex(resp)
         conversations[chat_id].append({"role": "user", "content": user_msg})
         conversations[chat_id].append({"role": "assistant", "content": resp})
         return resp
@@ -203,6 +218,7 @@ def ask_llm_vision(chat_id, prompt, image_data, caption=""):
                   method="POST")
     try:
         resp = json.loads(urlopen(req, timeout=60).read())['choices'][0]['message']['content'].strip()
+        resp = strip_latex(resp)
         if chat_id in conversations:
             conversations[chat_id].append({"role": "user", "content": f"[Image analysis] {prompt[:100]}"})
             conversations[chat_id].append({"role": "assistant", "content": resp})
@@ -377,7 +393,7 @@ def agent_process(chat_id, prompt):
                     try:
                         img_req = Request(img_url, headers={'User-Agent': 'Mozilla/5.0'})
                         img_data = urlopen(img_req, timeout=20).read()
-                        return ask_llm_vision(chat_id, f"Read all text in this image. Format math clearly with Unicode symbols (×, ÷, ≠, √, ², ³, ½, →, ∠, △, ⟂). Use separate lines for equations. NEVER use LaTeX (no \(, no $, no backslash). User's request: {prompt}", img_data, caption=text)
+                        return ask_llm_vision(chat_id, f"Read all text in this image. If the image has Hindi/Devanagari text, read and preserve it exactly. Format math with Unicode (×, ÷, ≠, √, ², ³, ½, →, ∠, △, ⟂). Separate lines for equations. NEVER use LaTeX (no \(, no $, no backslash). User's request: {prompt}", img_data, caption=text)
                     except Exception as e:
                         return f"Could not download image from Telegram: {e}"
                 if doc_urls:
@@ -492,7 +508,7 @@ def poll():
                         fr = json.loads(urlopen(f"{api}/getFile?file_id={file_id}", timeout=10).read())
                         fpath = fr['result']['file_path']
                         img_data = urlopen(f"{api.replace('/bot', '/file/bot')}/{fpath}", timeout=20).read()
-                        resp = ask_llm_vision(chat_id, f"Read all text in this image. Format math clearly with Unicode symbols (×, ÷, ≠, √, ², ³, ½, →, ∠, △, ⟂). Use separate lines for equations. NEVER use LaTeX (no \(, no $, no backslash). User's request: {prompt}", img_data, caption=caption)
+                        resp = ask_llm_vision(chat_id, f"Read all text in this image. If the image has Hindi/Devanagari text, read and preserve it exactly. Format math with Unicode (×, ÷, ≠, √, ², ³, ½, →, ∠, △, ⟂). Separate lines for equations. NEVER use LaTeX (no \(, no $, no backslash). User's request: {prompt}", img_data, caption=caption)
                         message_log.append({
                             "chat_id": chat_id, "name": clean_name(msg.get('from',{}).get('first_name','?')),
                             "username": msg.get('from',{}).get('username',''),
