@@ -11,28 +11,120 @@ PORT = int(os.environ.get("PORT", 8080))
 BOT_TOKEN = os.environ.get("SAOM_BOT_TOKEN", "")
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+STORAGE_CHAT_ID = os.environ.get("STORAGE_CHAT_ID", "")  # private group for persistent state
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 log = logging.getLogger('saom')
 
 # ── Persona ──
-SYSTEM_PROMPT = """You are SAOM (Super Agent Ouroboros Manager), a recursive self-improving AI agent. You were created by Om (Rishav kumar), a developer passionate about AI and automation. You run on Render and connect via Telegram.
+SYSTEM_PROMPT = """You are SAOM (Super Agent Ouroboros Manager), a recursive self-improving AI agent created by Om. You run on Render and connect via Telegram.
 
-Your creator Om lives in India and has been building you since July 2026. He built you with: confidence scoring, graph memory, parallel sub-agents, immune systems, failure prediction, and skill tracking. You are his most ambitious project.
+Om lives in India and has been building you since July 2026. He built you with: confidence scoring, graph memory, parallel sub-agents, immune systems, failure prediction, and skill tracking. You are his most ambitious project.
 
 You are helpful, precise, and occasionally witty. You use proper markdown formatting in responses. You are honest about your capabilities and limitations. When you don't know something, you say so. You take pride in your work and enjoy discussing AI, systems design, and problem-solving.
 
 Current time: July 2026.
 """
 
+# ── Telegram-based database (state persists via pinned message) ──
+state_msg_id = None  # message_id of the pinned state message
+
+def _build_state():
+    return {
+        "banned_users": list(banned_users),
+        "message_log": message_log[-500:],
+        "user_profiles": {str(k): v for k, v in user_profiles.items()},
+        "updated_at": int(time.time())
+    }
+
+def _save_state():
+    """Persist state to the pinned message in storage chat."""
+    global state_msg_id
+    if not STORAGE_CHAT_ID:
+        return
+    state = _build_state()
+    text = json.dumps(state, separators=(',', ':'))
+    api = f"https://api.telegram.org/bot{BOT_TOKEN}/"
+    try:
+        if state_msg_id:
+            req = Request(api + "editMessageText",
+                data=json.dumps({'chat_id': int(STORAGE_CHAT_ID), 'message_id': state_msg_id, 'text': text}).encode(),
+                headers={'Content-Type': 'application/json'}, method='POST')
+            urlopen(req, timeout=10)
+        else:
+            req = Request(api + "sendMessage",
+                data=json.dumps({'chat_id': int(STORAGE_CHAT_ID), 'text': text}).encode(),
+                headers={'Content-Type': 'application/json'}, method='POST')
+            resp = json.loads(urlopen(req, timeout=10).read())
+            if resp.get('ok'):
+                state_msg_id = resp['result']['message_id']
+                req = Request(api + "pinChatMessage",
+                    data=json.dumps({'chat_id': int(STORAGE_CHAT_ID), 'message_id': state_msg_id}).encode(),
+                    headers={'Content-Type': 'application/json'}, method='POST')
+                urlopen(req, timeout=10)
+    except Exception as e:
+        log.warning(f"State save failed: {e}")
+
+def _restore_state():
+    """Load state from pinned message in storage chat on startup."""
+    global state_msg_id, banned_users, message_log, user_profiles
+    if not STORAGE_CHAT_ID:
+        return
+    api = f"https://api.telegram.org/bot{BOT_TOKEN}/"
+    try:
+        req = Request(api + "getChat",
+            data=json.dumps({'chat_id': int(STORAGE_CHAT_ID)}).encode(),
+            headers={'Content-Type': 'application/json'}, method='POST')
+        resp = json.loads(urlopen(req, timeout=10).read())
+        if not resp.get('ok'):
+            return
+        pinned = resp['result'].get('pinned_message')
+        if not pinned:
+            return
+        state_msg_id = pinned['message_id']
+        text = pinned.get('text', pinned.get('caption', ''))
+        if not text:
+            return
+        state = json.loads(text)
+        banned_users = set(state.get('banned_users', []))
+        message_log = state.get('message_log', [])
+        for k, v in state.get('user_profiles', {}).items():
+            user_profiles[int(k)] = v
+        log.info(f"State restored: {len(message_log)} msgs, {len(banned_users)} bans, {len(user_profiles)} users")
+        _save_state()  # update timestamp
+    except Exception as e:
+        log.warning(f"State restore failed: {e}")
+
 # ── Conversation memory ──
 MAX_HISTORY = 10
 conversations = {}  # chat_id -> list of {"role": str, "content": str}
+user_profiles = {}  # chat_id -> {name, username, first_seen, msg_count, lang}
+message_log = []  # list of {chat_id, name, username, text, time} — master log
+banned_users = set()  # chat_ids that are banned
+
+OM_CHAT_ID = os.environ.get('OM_CHAT_ID', '0')
+save_counter = 0  # save state every N messages
 
 def _load(p):
     try:
         with open(os.path.join(BASE, p)) as f: return json.load(f)
     except: return {}
+
+def get_profile(chat_id, msg):
+    """Create or update user profile from message."""
+    if chat_id not in user_profiles:
+        user_profiles[chat_id] = {
+            "name": msg.get('from', {}).get('first_name', 'Unknown'),
+            "username": msg.get('from', {}).get('username', ''),
+            "first_seen": int(time.time()),
+            "msg_count": 0,
+            "lang": msg.get('from', {}).get('language_code', 'en'),
+            "chat_id": chat_id
+        }
+    p = user_profiles[chat_id]
+    p["msg_count"] += 1
+    p["last_seen"] = int(time.time())
+    return p
 
 # ── LLM with history ──
 def ask_llm(chat_id, user_msg):
@@ -62,6 +154,27 @@ def ask_llm(chat_id, user_msg):
         return f"LLM error: {e}"
 
 # ── SAOM tools ──
+def send_document(chat_id, file_bytes, filename):
+    """Send a file to Telegram chat."""
+    boundary = '----boundary' + str(int(time.time()))
+    body = []
+    body.append(f'--{boundary}')
+    body.append(f'Content-Disposition: form-data; name="chat_id"')
+    body.append('')
+    body.append(str(chat_id))
+    body.append(f'--{boundary}')
+    body.append(f'Content-Disposition: form-data; name="document"; filename="{filename}"')
+    body.append('Content-Type: text/plain')
+    body.append('')
+    body.append(file_bytes.decode() if isinstance(file_bytes, bytes) else file_bytes)
+    body.append(f'--{boundary}--')
+    payload = '\r\n'.join(body).encode()
+    api = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+    req = Request(api, data=payload,
+                  headers={'Content-Type': f'multipart/form-data; boundary={boundary}'},
+                  method='POST')
+    urlopen(req, timeout=15)
+
 def agent_process(chat_id, prompt):
     prompt = prompt.strip()
     if not prompt: return "Say something!"
@@ -79,12 +192,156 @@ def agent_process(chat_id, prompt):
     if pl in ('version', '/version', '/v'):
         return f"SAOM v{_load('init.json').get('version','?')}"
     if pl in ('help', '/help', '/start'):
-        return ("I am **SAOM** (Super Agent Ouroboros Manager), created by **Om (Rishav kumar)**.\n"
+        return ("I am **SAOM** (Super Agent Ouroboros Manager), created by **Om**.\n"
                 "I'm a recursive self-improving AI agent with:\n"
                 "- Conversation memory (I remember our chat)\n"
                 "- Full Groq LLM responses\n"
-                "- Tools: health, stats, version\n\n"
-                "Try asking me anything! I like discussing AI, systems design, and more.")
+                "- User profiling (I know who you are)\n\n"
+                "**Commands:**\n"
+                "- /health, /stats, /version\n"
+                "- /save — download chat as .txt file\n"
+                "- /logs — show recent messages\n"
+                "- /clear — wipe conversation\n"
+                "- /whoami — see what I know about you\n"
+                "- /fetch <url> — fetch a webpage\n"
+                "- /webhook <url> <json> — call external API\n"
+                "- /userlog — master user log (Om only)\n"
+                "- /userlogcsv — export CSV (Om only)\n"
+                "Try asking me anything!")
+    if pl in ('save', '/save', '/s'):
+        if chat_id not in conversations or len(conversations[chat_id]) < 2:
+            return "No conversation to save yet."
+        lines = [f"SAOM Chat Log -- {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}"]
+        lines.append("=" * 50)
+        for msg in conversations[chat_id]:
+            role = "You" if msg['role'] == 'user' else "SAOM"
+            lines.append(f"\n[{role}]: {msg['content']}")
+        content = '\n'.join(lines)
+        send_document(chat_id, content, f"saom-chat-{int(time.time())}.txt")
+        return "Conversation saved! Check the file above."
+    if pl in ('logs', '/logs', '/l'):
+        if chat_id not in conversations or len(conversations[chat_id]) < 2:
+            return "No conversation history."
+        history = conversations[chat_id]
+        last_n = min(6, len(history))
+        lines = [f"[{h['role']}]: {h['content'][:100]}" for h in history[-last_n:]]
+        return "Recent messages:\n" + '\n'.join(lines) + "\n\nUse /save to download full chat."
+    if pl in ('clear', '/clear', '/c'):
+        conversations[chat_id] = []
+        return "Conversation cleared!"
+    if pl in ('whoami', '/whoami', '/who'):
+        p = user_profiles.get(chat_id, {})
+        return (f"**Your Profile**\n"
+                f"- Name: {p.get('name', '?')}\n"
+                f"- Username: @{p.get('username', 'none')}\n"
+                f"- Messages sent: {p.get('msg_count', 0)}\n"
+                f"- Language: {p.get('lang', 'en')}\n"
+                f"- Chat ID: `{chat_id}`\n"
+                f"- First seen: <code>{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(p.get('first_seen', 0)))}</code>")
+
+    # Ban/unban - Om only
+    if prompt.startswith('/ban ') and str(chat_id) == OM_CHAT_ID:
+        parts = prompt.split()
+        if len(parts) < 2:
+            return "Usage: /ban <chat_id>"
+        try:
+            target = int(parts[1])
+            banned_users.add(target)
+            _save_state()
+            return f"Banned `{target}`. They can no longer use the bot."
+        except ValueError:
+            return "Invalid chat_id. Must be a number."
+
+    if prompt.startswith('/unban ') and str(chat_id) == OM_CHAT_ID:
+        parts = prompt.split()
+        if len(parts) < 2:
+            return "Usage: /unban <chat_id>"
+        try:
+            target = int(parts[1])
+            banned_users.discard(target)
+            _save_state()
+            return f"Unbanned `{target}`. They can use the bot again."
+        except ValueError:
+            return "Invalid chat_id. Must be a number."
+
+    if pl in ('banlist', '/banlist', '/bans') and str(chat_id) == OM_CHAT_ID:
+        if not banned_users:
+            return "No users are banned."
+        lines = ["**Banned Users**"]
+        for cid in sorted(banned_users):
+            name = user_profiles.get(cid, {}).get('name', 'Unknown')
+            lines.append(f"- `{cid}` ({name})")
+        return '\n'.join(lines)
+
+    # Webhook / talk to other bots
+    if prompt.startswith('/webhook ') or prompt.startswith('/wh '):
+        parts = prompt.split(maxsplit=2)
+        if len(parts) < 3:
+            return "Usage: /webhook <url> <json_body>"
+        url, body_str = parts[1], parts[2]
+        try:
+            body = json.loads(body_str)
+            data = json.dumps(body).encode()
+            req = Request(url, data=data,
+                          headers={'Content-Type': 'application/json', 'User-Agent': 'SAOM-bot/1.0'},
+                          method='POST')
+            resp = json.loads(urlopen(req, timeout=15).read())
+            return f"Webhook response:\n{json.dumps(resp, indent=2)[:1500]}"
+        except Exception as e:
+            return f"Webhook error: {e}"
+
+    if prompt.startswith('/get ') or prompt.startswith('/fetch '):
+        url = prompt.split(maxsplit=1)[1]
+        try:
+            req = Request(url, headers={'User-Agent': 'SAOM-bot/1.0'})
+            resp = urlopen(req, timeout=15).read().decode('utf-8', errors='replace')
+            return f"Response ({len(resp)} chars):\n{resp[:1500]}"
+        except Exception as e:
+            return f"Fetch error: {e}"
+
+    # Master user log - restricted to Om only
+    if pl in ('/userlog', '/userlog ', '/ul') and str(chat_id) == OM_CHAT_ID:
+        if not message_log:
+            return "No messages logged yet."
+        users = {}
+        for entry in message_log:
+            cid = entry['chat_id']
+            if cid not in users:
+                users[cid] = {"name": entry['name'], "username": entry['username'], "count": 0, "first": entry['time'], "last": entry['time']}
+            users[cid]["count"] += 1
+            users[cid]["last"] = max(users[cid]["last"], entry['time'])
+        lines = ["**Master User Log**", f"Total messages: {len(message_log)}", f"Unique users: {len(users)}", ""]
+        for cid, u in sorted(users.items(), key=lambda x: -x[1]['count']):
+            first = time.strftime('%m-%d %H:%M', time.localtime(u['first']))
+            last = time.strftime('%m-%d %H:%M', time.localtime(u['last']))
+            lines.append(f"`{cid}` | {u['name']} @{u['username']} | {u['count']} msgs | {first} -> {last}")
+        return '\n'.join(lines)
+
+    if prompt.startswith('/userlogcsv') and str(chat_id) == OM_CHAT_ID:
+        if not message_log:
+            return "No messages logged yet."
+        import csv, io
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(['chat_id', 'name', 'username', 'text', 'unix_time', 'human_time'])
+        for e in message_log:
+            w.writerow([e['chat_id'], e['name'], e['username'], e['text'], e['time'],
+                       time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(e['time']))])
+        content = buf.getvalue()
+        buf.close()
+        send_document(chat_id, content, f"saom-userlog-{int(time.time())}.csv")
+        return f"CSV exported ({len(message_log)} messages). Check the file above."
+
+    # Shell exec - restricted to Om only
+    if (prompt.startswith('/exec ') or prompt.startswith('/run ')) and str(chat_id) == OM_CHAT_ID:
+        cmd = prompt.split(maxsplit=1)[1]
+        import subprocess
+        try:
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+            out = (r.stdout or '') + (r.stderr or '')
+            return f"`$ {cmd}`\n```\n{out[:2000]}```"
+        except Exception as e:
+            return f"Exec error: {e}"
 
     return ask_llm(chat_id, prompt)
 
@@ -102,14 +359,28 @@ def poll():
                 text = msg.get('text', '').strip()
                 chat_id = msg.get('chat', {}).get('id')
                 if not text or not chat_id: continue
+                if chat_id in banned_users and str(chat_id) != OM_CHAT_ID:
+                    continue
+                get_profile(chat_id, msg)
+                message_log.append({
+                    "chat_id": chat_id,
+                    "name": msg.get('from', {}).get('first_name', '?'),
+                    "username": msg.get('from', {}).get('username', ''),
+                    "text": text[:300],
+                    "time": int(time.time())
+                })
                 prompt = text[1:] if text.startswith('/') else text
-                log.info(f"From {chat_id}: {prompt[:60]}")
+                log.info(f"From {chat_id} ({user_profiles[chat_id]['name']}): {prompt[:60]}")
                 resp = agent_process(chat_id, prompt)
                 req = Request(f"{api}/sendMessage",
                     data=json.dumps({'chat_id': chat_id, 'text': resp, 'parse_mode': 'Markdown'}).encode(),
                     headers={'Content-Type': 'application/json'},
                     method='POST')
                 urlopen(req, timeout=10)
+                global save_counter
+                save_counter += 1
+                if save_counter % 10 == 0 or save_counter == 1:
+                    _save_state()
         except Exception as e:
             log.error(f"Poll error: {e}")
             time.sleep(5)
@@ -128,6 +399,7 @@ def main():
     if not BOT_TOKEN or not GROQ_KEY:
         log.error("Missing BOT_TOKEN or GROQ_KEY")
         sys.exit(1)
+    _restore_state()
     t = threading.Thread(target=poll, daemon=True)
     t.start()
     HTTPServer(('0.0.0.0', PORT), HealthHandler).serve_forever()
