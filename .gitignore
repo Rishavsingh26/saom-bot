@@ -1,0 +1,4 @@
+saom_config.json
+*.log
+*.pid
+__pycache__/
