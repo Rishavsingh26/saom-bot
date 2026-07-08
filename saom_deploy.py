@@ -38,12 +38,18 @@ Om lives in India and has been building you since July 2026. He built you with: 
 
 You are helpful, precise, and occasionally witty. You use proper markdown formatting in responses. You are honest about your capabilities and limitations. When you don't know something, you say so. You take pride in your work and enjoy discussing AI, systems design, and problem-solving.
 
-FORMATTING RULES:
+MATH RULES (follow strictly for math questions):
 - NEVER use LaTeX (\( \), $$, \[ \]) — Telegram can't render it.
-- For math, use Unicode symbols: × ÷ ≠ √ ² ³ ½ ¼ → ∠ △ ⟂ ≡ ≈ ∞ ∴
-- Use `^` for exponents only if Unicode unavailable.
-- Use separate lines for equations.
-- BE CONCISE: No full-sentence explanations, no "Step 1:" headers, no "we can calculate" fluff. Just equations, values, and the answer. Only explain if asked.
+- Use Unicode: × ÷ ≠ √ ² ³ ½ ¼ → ∠ △ ⟂ ≡ ≈ ∞ ∴
+- BE CONCISE: Equations + values + answer. No "Step 1:" or full sentences.
+- Verify answer: plug back into problem. Clean integer = usually correct.
+- Check failure patterns: off-by-one, unit mismatch, sign errors, percent confusion.
+
+PROBLEM-SOLVING METHOD:
+1. Recognize pattern (Time&Work→LCM, Profit→assume CP=100, Mixtures→alligation, Geometry→draw & formula)
+2. Apply fastest domain method
+3. Verify quickly
+4. Return answer only (explain only if asked)
 
 Current time: July 2026.
 """
@@ -519,6 +525,22 @@ def poll():
                     continue
                 else:
                     prompt = text[1:] if text.startswith('/') else text
+                # Handle /solve as reply: read the replied-to message
+                if text.lower().startswith('/solve') or text.lower().startswith('solve'):
+                    reply_to = msg.get('reply_to_message')
+                    if reply_to:
+                        rtext = reply_to.get('text', '').strip()
+                        rcaption = reply_to.get('caption', '').strip()
+                        rphoto = reply_to.get('photo')
+                        if rphoto:
+                            is_photo = True
+                            photo = rphoto
+                            caption = rcaption
+                            prompt = rcaption or "Solve this problem from the image"
+                        elif rtext:
+                            prompt = f"Solve this: {rtext}"
+                        else:
+                            prompt = "Solve this problem"
                 # Show typing indicator while processing
                 urlopen(Request(f"{api}/sendChatAction", 
                     data=json.dumps({'chat_id': chat_id, 'action': 'typing'}).encode(),
