@@ -18,15 +18,16 @@ logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', date
 log = logging.getLogger('saom')
 
 def strip_latex(text):
-    """Remove all LaTeX - Telegram can't render it."""
+    """Remove LaTeX - Telegram can't render it. Preserves newlines."""
     text = re.sub(r'\\frac\{([^}]*)\}\{([^}]*)\}', r'\1/\2', text)
     text = re.sub(r'\\[a-zA-Z]+\{([^}]*)\}', r'\1', text)
     text = re.sub(r'\\[\(\)\[\]]', '', text)
     text = re.sub(r'\\[a-zA-Z]+', '', text)
     text = re.sub(r'\$+', '', text)
     text = re.sub(r'\{|\}', '', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+    lines = [l.strip() for l in text.split('\n')]
+    lines = [l for l in lines if l]
+    return '\n'.join(lines)
 
 # ── Persona ──
 SYSTEM_PROMPT = """You are SAOM (Super Agent Ouroboros Manager), a recursive self-improving AI agent created by Om. You run on Render and connect via Telegram.
@@ -201,8 +202,16 @@ def ask_llm(chat_id, user_msg):
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for h in history:
         messages.append(h)
-    # Conciseness instruction — injected for ALL queries, always
-    concise_msg = "CRITICAL: Respond in 2 lines max. Just equations/values. No words, no LaTeX.\n\n" + user_msg
+    # Math detection — only inject equation format for math queries
+    math_keywords = ['math', 'solve', 'find', 'calculate', '=?', '= ?', 'km', 'km/h', 'cm', 'm/s', 'ratio',
+                     'profit', 'loss', 'interest', 'speed', 'time', 'work', 'age', 'avg', 'area',
+                     'volume', 'perimeter', 'train', 'boat', 'stream', 'mixture', 'allegation',
+                     'number', 'digit', 'sum', 'difference', 'product', '%', '÷', '×', '+', '-', '/']
+    is_math = any(kw in user_msg.lower() for kw in math_keywords)
+    if is_math:
+        concise_msg = "Answer with short equation-lines showing working. One equation per line. Answer on last line. 3 lines min, 7 lines max. No LaTeX.\n\n" + user_msg
+    else:
+        concise_msg = "Answer concisely. 1-2 lines max. No LaTeX.\n\n" + user_msg
     messages.append({"role": "user", "content": concise_msg})
     body = json.dumps({
         "model": MODEL,
@@ -235,8 +244,14 @@ def ask_llm_vision(chat_id, prompt, image_data, caption=""):
         mime = "image/webp"
     else:
         mime = "image/jpeg"
-    # Always inject conciseness for vision too
-    vision_prompt = "CRITICAL: Respond in 2 lines max. Just equations/values. No words, no LaTeX.\n\n" + prompt
+    # Math detection for vision too
+    math_keywords = ['math', 'solve', 'find', 'calculate', '=?', '= ?', 'km', 'ratio', 'profit', 'loss',
+                     'speed', 'time', 'work', 'area', 'volume', 'perimeter', 'sum', '%', '÷', '+', '-']
+    is_math = any(kw in prompt.lower() for kw in math_keywords)
+    if is_math:
+        vision_prompt = "Answer with short equation-lines showing working. One equation per line. Answer on last line. 3 lines min, 7 lines max. No LaTeX.\n\n" + prompt
+    else:
+        vision_prompt = "Answer concisely. 1-2 lines max. No LaTeX.\n\n" + prompt
     content = []
     if caption:
         content.append({"type": "text", "text": f"Caption: {caption}"})
