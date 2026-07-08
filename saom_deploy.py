@@ -11,7 +11,7 @@ PORT = int(os.environ.get("PORT", 8080))
 BOT_TOKEN = os.environ.get("SAOM_BOT_TOKEN", "")
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
-VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "llama-3.2-11b-vision-preview")
+VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 STORAGE_CHAT_ID = os.environ.get("STORAGE_CHAT_ID", "")  # private group for persistent state
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
@@ -171,17 +171,25 @@ def ask_llm_vision(chat_id, prompt, image_data, caption=""):
     """Send prompt + image to Groq vision model."""
     import base64
     b64 = base64.b64encode(image_data).decode()
-    ext = "image/jpeg"
+    if image_data[:4] == b'\x89PNG':
+        mime = "image/png"
+    elif image_data[:2] == b'\xff\xd8':
+        mime = "image/jpeg"
+    elif image_data[:4] == b'RIFF':
+        mime = "image/webp"
+    else:
+        mime = "image/jpeg"
     content = []
     if caption:
         content.append({"type": "text", "text": f"Caption: {caption}"})
     content.append({"type": "text", "text": prompt})
-    content.append({"type": "image_url", "image_url": {"url": f"data:{ext};base64,{b64}"}})
+    content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
     body = json.dumps({
         "model": VISION_MODEL,
         "messages": [{"role": "user", "content": content}],
         "max_tokens": 2048, "temperature": 0.7
     }).encode()
+    log.info(f"Vision request: model={VISION_MODEL}, caption={'yes' if caption else 'no'}, img_size={len(image_data)} bytes")
     req = Request("https://api.groq.com/openai/v1/chat/completions",
                   data=body,
                   headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json",
@@ -363,7 +371,7 @@ def agent_process(chat_id, prompt):
                     try:
                         img_req = Request(img_url, headers={'User-Agent': 'Mozilla/5.0'})
                         img_data = urlopen(img_req, timeout=20).read()
-                        return ask_llm_vision(chat_id, f"Analyze this image. User's request: {prompt}", img_data, caption=text)
+                        return ask_llm_vision(chat_id, f"Read all text in this image (Hindi, English, or any language). User's request: {prompt}", img_data, caption=text)
                     except Exception as e:
                         return f"Could not download image from Telegram: {e}"
                 if doc_urls:
@@ -466,11 +474,38 @@ def poll():
                 text = msg.get('text', '').strip()
                 chat_id = msg.get('chat', {}).get('id')
                 if not chat_id: continue
-                if not text:
-                    continue  # skip non-text messages (photos, stickers, etc.)
                 if chat_id in banned_users and str(chat_id) != OM_CHAT_ID:
                     continue
                 get_profile(chat_id, msg)
+                photo = msg.get('photo')
+                caption = msg.get('caption', '').strip()
+                if photo:
+                    file_id = photo[-1]['file_id']
+                    prompt = caption or "Describe this image"
+                    try:
+                        fr = json.loads(urlopen(f"{api}/getFile?file_id={file_id}", timeout=10).read())
+                        fpath = fr['result']['file_path']
+                        img_data = urlopen(f"{api.replace('/bot', '/file/bot')}/{fpath}", timeout=20).read()
+                        resp = ask_llm_vision(chat_id, f"Read all text in this image (Hindi, English, or any language). User's request: {prompt}", img_data, caption=caption)
+                        message_log.append({
+                            "chat_id": chat_id, "name": clean_name(msg.get('from',{}).get('first_name','?')),
+                            "username": msg.get('from',{}).get('username',''),
+                            "text": f"[Photo] {caption[:200]}" if caption else "[Photo]",
+                            "time": int(time.time())
+                        })
+                    except Exception as e:
+                        resp = f"Error processing image: {e}"
+                    req = Request(f"{api}/sendMessage",
+                        data=json.dumps({'chat_id': chat_id, 'text': resp, 'parse_mode': 'Markdown'}).encode(),
+                        headers={'Content-Type': 'application/json'}, method='POST')
+                    urlopen(req, timeout=10)
+                    global save_counter
+                    save_counter += 1
+                    if save_counter % 10 == 0:
+                        _save_state()
+                    continue
+                if not text:
+                    continue  # skip other non-text messages (stickers, voice, etc.)
                 message_log.append({
                     "chat_id": chat_id,
                     "name": clean_name(msg.get('from', {}).get('first_name', '?')),
@@ -486,7 +521,6 @@ def poll():
                     headers={'Content-Type': 'application/json'},
                     method='POST')
                 urlopen(req, timeout=10)
-                global save_counter
                 save_counter += 1
                 if save_counter % 10 == 0 or save_counter == 1:
                     _save_state()
