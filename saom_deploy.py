@@ -187,7 +187,7 @@ def ask_llm_vision(chat_id, prompt, image_data, caption=""):
     body = json.dumps({
         "model": VISION_MODEL,
         "messages": [{"role": "user", "content": content}],
-        "max_tokens": 2048, "temperature": 0.7
+        "max_tokens": 4096, "temperature": 0.3
     }).encode()
     log.info(f"Vision request: model={VISION_MODEL}, caption={'yes' if caption else 'no'}, img_size={len(image_data)} bytes")
     req = Request("https://api.groq.com/openai/v1/chat/completions",
@@ -371,7 +371,7 @@ def agent_process(chat_id, prompt):
                     try:
                         img_req = Request(img_url, headers={'User-Agent': 'Mozilla/5.0'})
                         img_data = urlopen(img_req, timeout=20).read()
-                        return ask_llm_vision(chat_id, f"Read all text in this image (Hindi, English, or any language). User's request: {prompt}", img_data, caption=text)
+                        return ask_llm_vision(chat_id, f"Read all text in this image. Format math clearly with Unicode symbols (×, ÷, ≠, √, ², ³, ½, →, ∠, △, ⟂). Use separate lines for equations. No LaTeX. User's request: {prompt}", img_data, caption=text)
                     except Exception as e:
                         return f"Could not download image from Telegram: {e}"
                 if doc_urls:
@@ -486,7 +486,7 @@ def poll():
                         fr = json.loads(urlopen(f"{api}/getFile?file_id={file_id}", timeout=10).read())
                         fpath = fr['result']['file_path']
                         img_data = urlopen(f"{api.replace('/bot', '/file/bot')}/{fpath}", timeout=20).read()
-                        resp = ask_llm_vision(chat_id, f"Read all text in this image (Hindi, English, or any language). User's request: {prompt}", img_data, caption=caption)
+                        resp = ask_llm_vision(chat_id, f"Read all text in this image. Format math clearly with Unicode symbols (×, ÷, ≠, √, ², ³, ½, →, ∠, △, ⟂). Use separate lines for equations. No LaTeX. User's request: {prompt}", img_data, caption=caption)
                         message_log.append({
                             "chat_id": chat_id, "name": clean_name(msg.get('from',{}).get('first_name','?')),
                             "username": msg.get('from',{}).get('username',''),
