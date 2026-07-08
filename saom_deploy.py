@@ -38,19 +38,11 @@ Om lives in India and has been building you since July 2026. He built you with: 
 
 You are helpful, precise, and occasionally witty. You use proper markdown formatting in responses. You are honest about your capabilities and limitations. When you don't know something, you say so. You take pride in your work and enjoy discussing AI, systems design, and problem-solving.
 
-DEFAULT BEHAVIOR: Give shortest possible answer (just result/value). No explanation, no steps. If user says "explain", "how", "steps", or "detail" → then give full solution.
+ALWAYS respond BRIEFLY. Short answer, one line max. Full detail only if user says "explain", "how", "steps", or "detail".
 
-MATH RULES (follow strictly for math questions):
-- NEVER use LaTeX (\( \), $$, \[ \]) — Telegram can't render it.
-- Use Unicode: × ÷ ≠ √ ² ³ ½ ¼ → ∠ △ ⟂ ≡ ≈ ∞ ∴
-- Verify answer by plugging back. Clean integer = usually correct.
-- Check: off-by-one, unit mismatch, sign errors, percent confusion.
-
-PROBLEM-SOLVING METHOD:
-1. Recognize pattern (Time&Work→LCM, Profit→assume CP=100, Mixtures→alligation, Geometry→draw & formula)
-2. Apply fastest domain method
-3. Verify quickly
-4. Return answer only
+MATH:
+- Never LaTeX. Use Unicode: × ÷ ≠ √ ² ³ ½ ¼ → ∠ △ ⟂ ≡ ≈ ∞ ∴
+- Problem-solving: recognize pattern → fastest method → verify → answer
 
 Current time: July 2026.
 """
@@ -189,6 +181,22 @@ def get_profile(chat_id, msg):
     p["last_seen"] = int(time.time())
     return p
 
+def _api_retry(req, max_retries=4):
+    """POST with exponential backoff on 429."""
+    delay = 1
+    for attempt in range(max_retries):
+        try:
+            return json.loads(urlopen(req, timeout=60).read())
+        except Exception as e:
+            err_str = str(e)
+            if '429' in err_str and attempt < max_retries - 1:
+                log.warning(f"429 rate limit, retrying in {delay}s...")
+                time.sleep(delay)
+                delay *= 2
+            else:
+                raise
+    raise Exception("Max retries exceeded")
+
 # ── LLM with history ──
 def ask_llm(chat_id, user_msg):
     if chat_id not in conversations:
@@ -209,7 +217,7 @@ def ask_llm(chat_id, user_msg):
                            "User-Agent": "Mozilla/5.0 (compatible; SAOM-bot/1.0)"},
                   method="POST")
     try:
-        resp = json.loads(urlopen(req, timeout=30).read())['choices'][0]['message']['content'].strip()
+        resp = _api_retry(req)['choices'][0]['message']['content'].strip()
         resp = strip_latex(resp)
         conversations[chat_id].append({"role": "user", "content": user_msg})
         conversations[chat_id].append({"role": "assistant", "content": resp})
@@ -246,7 +254,7 @@ def ask_llm_vision(chat_id, prompt, image_data, caption=""):
                            "User-Agent": "Mozilla/5.0 (compatible; SAOM-bot/1.0)"},
                   method="POST")
     try:
-        resp = json.loads(urlopen(req, timeout=60).read())['choices'][0]['message']['content'].strip()
+        resp = _api_retry(req)['choices'][0]['message']['content'].strip()
         resp = strip_latex(resp)
         if chat_id in conversations:
             conversations[chat_id].append({"role": "user", "content": f"[Image analysis] {prompt[:100]}"})
@@ -553,9 +561,9 @@ def poll():
                     check_text = (text + " " + caption).lower()
                     if f"@{BOT_USERNAME}" not in check_text:
                         continue
-                    # Strip mention for cleaner prompt
-                    text = text.replace(f"@{BOT_USERNAME}", "").replace(f"@{BOT_USERNAME.capitalize()}", "").strip()
-                    caption = caption.replace(f"@{BOT_USERNAME}", "").replace(f"@{BOT_USERNAME.capitalize()}", "").strip()
+                    # Strip mention for cleaner prompt (case-insensitive)
+                    text = re.sub(rf'@{re.escape(BOT_USERNAME)}\b', '', text, flags=re.I).strip()
+                    caption = re.sub(rf'@{re.escape(BOT_USERNAME)}\b', '', caption, flags=re.I).strip()
                     # Only admins can use the bot in groups
                     if not _is_admin(api, chat_id, user_id):
                         continue
@@ -572,6 +580,8 @@ def poll():
                 else:
                     prompt = text[1:] if text.startswith('/') else text
                 # Auto-read replied-to message for context
+                uid = msg.get('from', {}).get('id')
+                is_solve = text.lower().startswith('/solve') or text.lower().startswith('solve ')
                 reply_to = msg.get('reply_to_message')
                 if reply_to:
                     rtext = reply_to.get('text', '').strip()
@@ -581,17 +591,20 @@ def poll():
                         is_photo = True
                         photo = rphoto
                         caption = rcaption
-                    elif rtext and not prompt.startswith('Solve this:'):
-                        prompt = f"Replied to: {rtext[:500]}\n\nUser: {prompt}"
-                # Inject user context (what they last asked)
-                uid = msg.get('from', {}).get('id')
-                if uid and uid in user_context:
+                        if is_solve:
+                            prompt = "Solve this problem from the image. SHORT ANSWER ONLY."
+                    elif is_solve:
+                        prompt = f"Solve this. SHORT ANSWER ONLY (just result): {rtext[:500]}"
+                    elif rtext:
+                        prompt = f"Replied to: {rtext[:500]}\nUser: {prompt}"
+                elif is_solve:
+                    query = prompt[6:].strip() if len(text) > 6 else ""
+                    prompt = f"SHORT ANSWER ONLY (just result): {query}" if query else "SHORT ANSWER ONLY."
+                # Inject user context for follow-ups (no reply, no solve)
+                if uid and uid in user_context and not reply_to and not is_solve and not prompt.startswith('/'):
                     ctx = user_context[uid]
-                    if time.time() - ctx.get('timestamp', 0) < 1800 and not reply_to and not prompt.startswith('/'):
-                        prompt = f"[Last topic: {ctx.get('last_topic', '')[:200]}]\n{prompt}"
-                # Handle /solve without reply
-                if prompt.startswith('solve ') or prompt == 'solve':
-                    prompt = f"Answer concisely: {prompt[6:] if len(prompt)>6 else '(what?)'}"
+                    if time.time() - ctx.get('timestamp', 0) < 1800:
+                        prompt = f"[Context: {ctx.get('last_topic', '')[:100]}]\n{prompt}"
                 # Show typing indicator while processing
                 urlopen(Request(f"{api}/sendChatAction", 
                     data=json.dumps({'chat_id': chat_id, 'action': 'typing'}).encode(),
