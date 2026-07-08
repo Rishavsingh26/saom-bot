@@ -10,7 +10,7 @@ BASE = os.path.join(CODE_DIR, '.opencode', 'skills', 'saom', 'memory')
 PORT = int(os.environ.get("PORT", 8080))
 BOT_TOKEN = os.environ.get("SAOM_BOT_TOKEN", "")
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
-MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
 VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 STORAGE_CHAT_ID = os.environ.get("STORAGE_CHAT_ID", "")  # private group for persistent state
 
