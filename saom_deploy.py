@@ -10,7 +10,7 @@ BASE = os.path.join(CODE_DIR, '.opencode', 'skills', 'saom', 'memory')
 PORT = int(os.environ.get("PORT", 8080))
 BOT_TOKEN = os.environ.get("SAOM_BOT_TOKEN", "")
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
-MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
+MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 STORAGE_CHAT_ID = os.environ.get("STORAGE_CHAT_ID", "")  # private group for persistent state
 
@@ -231,22 +231,23 @@ def ask_llm(chat_id, user_msg):
     for h in history:
         messages.append(h)
     # Math detection — targeted keywords, exclude non-math question words
-    non_math_words = ['who', 'what is', 'what are', 'where', 'when', 'why', 'how', 'which',
-                      'who created', 'define', 'explain', 'tell me about', 'difference between']
+    non_math_words = ['who is', 'what is', 'what are', 'where is', 'when did', 'why does',
+                      'how does', 'how do', 'which is', 'who created', 'define', 'explain',
+                      'tell me about', 'difference between', 'what was', 'what does']
     is_non_math = any(kw in user_msg.lower() for kw in non_math_words)
+    math_priority = ['=?', '= ?', '×', '÷', '%', 'km/h', 'calculate', 'solve', 'find']
     math_keywords = ['math', 'solve', 'find', 'calculate', '=?', '= ?', 'km', 'km/h', 'cm', 'm/s',
                      'ratio', 'profit', 'loss', 'interest', 'speed', 'time', 'work', 'age', 'avg',
                      'area', 'volume', 'perimeter', 'train', 'boat', 'stream', 'mixture', 'allegation',
                      'number', 'digit', 'sum', 'difference', 'product', 'divide', 'multiple',
                      '%', '÷', '×', '=x', '=y']
-    is_math = any(kw in user_msg.lower() for kw in math_keywords) and not is_non_math
-    # Also check for number patterns like "A:B" or "9:13"
+    is_math = any(kw in user_msg.lower() for kw in math_priority) or (any(kw in user_msg.lower() for kw in math_keywords) and not is_non_math)
     if not is_math and not is_non_math:
-        is_math = bool(re.search(r'\d+\s*:\s*\d+', user_msg))  # ratio pattern
+        is_math = bool(re.search(r'\d+\s*:\s*\d+', user_msg))
     if is_math:
         concise_msg = "Answer ONLY with 3-7 equation lines. One equation per line. Intermediate working shown. Final answer on last line. No LaTeX. No prose. No reasoning. JUST EQUATIONS.\n\n" + user_msg
-        temp = 0.2
-        maxtok = 512
+        temp = 0.3
+        maxtok = 1024
     else:
         concise_msg = "Answer concisely. 1-4 lines. No LaTeX.\n\n" + user_msg
         temp = 0.7
@@ -295,7 +296,7 @@ def ask_llm_vision(chat_id, prompt, image_data, caption=""):
         is_math = bool(re.search(r'\d+\s*:\s*\d+', prompt))  # ratio pattern
     if is_math:
         vision_prompt = "Answer ONLY with 3-7 equation lines. One equation per line. Intermediate working shown. Final answer on last line. No LaTeX. No prose. No reasoning. JUST EQUATIONS.\n\n" + prompt
-        vtemp = 0.2
+        vtemp = 0.3
         vmaxtok = 1024
     else:
         vision_prompt = "Answer concisely. 1-4 lines. No LaTeX.\n\n" + prompt
@@ -555,7 +556,7 @@ def agent_process(chat_id, prompt):
             lines.append(f"`{cid}` | {u['name']} @{u['username']} | {u['count']} msgs | {first} -> {last}")
         return '\n'.join(lines)
 
-    if prompt.startswith('userlogcsv') and str(chat_id) == OM_CHAT_ID:
+    if (prompt.startswith('userlogcsv') or prompt.startswith('/userlogcsv')) and str(chat_id) == OM_CHAT_ID:
         if not message_log:
             return "No messages logged yet."
         import csv, io
