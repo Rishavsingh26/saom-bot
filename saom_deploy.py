@@ -5,8 +5,22 @@ import json, os, sys, threading, time, logging, re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.request import Request, urlopen
 
-CODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BASE = os.path.join(CODE_DIR, '.opencode', 'skills', 'saom', 'memory')
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CODE_DIR = os.path.join(_SCRIPT_DIR, '..')  # Codex/
+BASE = os.environ.get("SAOM_MEMORY_DIR", "")  # allow env override for Render
+if not BASE:
+    # Try multiple locations in order
+    candidates = [
+        os.path.join(CODE_DIR, '.opencode', 'skills', 'saom', 'memory'),
+        os.path.join(_SCRIPT_DIR, 'saom_memory'),
+        os.path.join(_SCRIPT_DIR, 'memory'),
+    ]
+    for c in candidates:
+        if os.path.isdir(c):
+            BASE = c
+            break
+    if not BASE:
+        BASE = candidates[0]  # fallback to first
 PORT = int(os.environ.get("PORT", 8080))
 BOT_TOKEN = os.environ.get("SAOM_BOT_TOKEN", "")
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
@@ -230,26 +244,54 @@ def ask_llm(chat_id, user_msg):
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for h in history:
         messages.append(h)
-    # Math detection — targeted keywords, exclude non-math question words
+    # Non-math detection — expanded to catch GK, physics, general questions
     non_math_words = ['who is', 'what is', 'what are', 'where is', 'when did', 'why does',
                       'how does', 'how do', 'which is', 'who created', 'define', 'explain',
-                      'tell me about', 'difference between', 'what was', 'what does']
+                      'tell me about', 'difference between', 'what was', 'what does',
+                      'who are', 'what did', 'where do', 'when was',
+                      'newton', 'force', 'gravity', 'acceleration', 'velocity',
+                      'national', 'capital of', 'president', 'prime minister',
+                      'born', 'invent', 'discover', 'invented', 'discovered']
     is_non_math = any(kw in user_msg.lower() for kw in non_math_words)
-    math_priority = ['=?', '= ?', '×', '÷', '%', 'km/h', 'calculate', 'solve', 'find']
-    math_keywords = ['math', 'solve', 'find', 'calculate', '=?', '= ?', 'km', 'km/h', 'cm', 'm/s',
-                     'ratio', 'profit', 'loss', 'interest', 'speed', 'time', 'work', 'age', 'avg',
+    # Math detection — only flag =? if accompanied by math-domain content
+    has_eq_question = '=?' in user_msg.lower() or '= ?' in user_msg.lower()
+    has_math_domain = bool(re.search(r'\d+\s*[×÷+\-]\s*\d+|^\d+\s*=|[=×÷]\s*\d+\s*[=×÷]| \d+x | \d+y ', user_msg.lower())) or \
+                      any(kw in user_msg.lower() for kw in ['km/h', 'm/s', 'ratio', 'profit', 'loss', 'interest',
+                            'speed', 'time', 'work', 'age', 'avg', 'area', 'volume', 'perimeter',
+                            'train', 'boat', 'stream', 'mixture', 'allegation', 'sum', 'divide'])
+    # Detect SOLUTION pattern: user is posting equations as an answer, not asking a question
+    solution_patterns = [
+        r'^\s*(?:\w+\s*[:=]\s*)?\-?\d+\s*$',     # standalone "x = 65" or "y = 53"
+        r'^\s*\w+\s*\+?\s*\w+\s*=\s*\d+',         # "x + y = 118"
+        r'^\s*\w+\s*=\s*\d+\s*[-+×÷]\s*\d+',     # "x = 855 - 530"
+        r'^\d+\s*[-+]\s*\d+\s*=\s*\d+',            # "855 - 590 = 265"
+    ]
+    is_solution_share = any(re.match(p, user_msg.strip()) for p in solution_patterns) and \
+                        not any(kw in user_msg.lower() for kw in ['solve', 'find', 'calculate', 'what', 'how'])
+    math_priority = ['calculate', 'solve', 'find']
+    math_keywords = ['math', 'ratio', 'profit', 'loss', 'interest', 'speed', 'time', 'work', 'age', 'avg',
                      'area', 'volume', 'perimeter', 'train', 'boat', 'stream', 'mixture', 'allegation',
                      'number', 'digit', 'sum', 'difference', 'product', 'divide', 'multiple',
                      '%', '÷', '×', '=x', '=y']
-    is_math = any(kw in user_msg.lower() for kw in math_priority) or (any(kw in user_msg.lower() for kw in math_keywords) and not is_non_math)
+    # Determine if math: priority words, or math domain keywords (not non-math), or =? with math domain content
+    is_math = any(kw in user_msg.lower() for kw in math_priority) or \
+              (any(kw in user_msg.lower() for kw in math_keywords) and not is_non_math) or \
+              (has_eq_question and has_math_domain and not is_non_math)
     if not is_math and not is_non_math:
-        is_math = bool(re.search(r'\d+\s*:\s*\d+', user_msg))
+        is_math = bool(re.search(r'\d+\s*:\s*\d+', user_msg)) and not has_eq_question
+    # If user is posting a solution, treat as non-math response (acknowledge, don't re-solve)
+    if is_solution_share and not any(kw in user_msg.lower() for kw in ['solve', 'find', 'calculate', '?', 'how to']):
+        is_math = False
     if is_math:
         concise_msg = "Answer ONLY with 3-7 equation lines. One equation per line. Intermediate working shown. Final answer on last line. No LaTeX. No prose. No reasoning. JUST EQUATIONS.\n\n" + user_msg
         temp = 0.3
         maxtok = 1024
+    elif is_solution_share:
+        concise_msg = "The user posted an answer/solution. Confirm it briefly and supportively. If correct, say 'Correct'. If wrong, give the right answer in 2-3 lines. No equations format.\n\n" + user_msg
+        temp = 0.5
+        maxtok = 256
     else:
-        concise_msg = "Answer concisely. 1-4 lines. No LaTeX.\n\n" + user_msg
+        concise_msg = "Answer concisely. 1-4 lines. No LaTeX. DO NOT use equation format for non-math questions.\n\n" + user_msg
         temp = 0.7
         maxtok = 1024
     messages.append({"role": "user", "content": concise_msg})
@@ -286,14 +328,22 @@ def ask_llm_vision(chat_id, prompt, image_data, caption=""):
         mime = "image/jpeg"
     # Math detection for vision too
     non_math_words = ['who', 'what is', 'what are', 'where', 'when', 'why', 'how', 'which',
-                      'who created', 'define', 'explain', 'tell me about', 'difference between']
+                      'who created', 'define', 'explain', 'tell me about', 'difference between',
+                      'who are', 'what did', 'where do', 'when was',
+                      'newton', 'force', 'gravity', 'acceleration', 'velocity',
+                      'national', 'capital of', 'president', 'prime minister',
+                      'born', 'invent', 'discover', 'invented', 'discovered']
     is_non_math = any(kw in prompt.lower() for kw in non_math_words)
-    math_keywords = ['math', 'solve', 'find', 'calculate', '=?', '= ?', 'km', 'ratio', 'profit', 'loss',
+    math_keywords = ['math', 'solve', 'find', 'calculate', 'km', 'ratio', 'profit', 'loss',
                      'speed', 'time', 'work', 'area', 'volume', 'perimeter', 'sum', 'divide',
                      '%', '÷', '×', '=x', '=y']
+    has_eq_question = '=?' in prompt.lower() or '= ?' in prompt.lower()
+    has_math_domain = bool(re.search(r'\d+\s*[×÷+\-]\s*\d+|^\d+\s*=', prompt.lower()))
     is_math = any(kw in prompt.lower() for kw in math_keywords) and not is_non_math
+    if has_eq_question and has_math_domain and not is_non_math:
+        is_math = True
     if not is_math and not is_non_math:
-        is_math = bool(re.search(r'\d+\s*:\s*\d+', prompt))  # ratio pattern
+        is_math = bool(re.search(r'\d+\s*:\s*\d+', prompt)) and not has_eq_question
     if is_math:
         vision_prompt = "Answer ONLY with 3-7 equation lines. One equation per line. Intermediate working shown. Final answer on last line. No LaTeX. No prose. No reasoning. JUST EQUATIONS.\n\n" + prompt
         vtemp = 0.3
@@ -503,22 +553,7 @@ def agent_process(chat_id, prompt):
                     doc_name_match = re.search(r'<div class="tgme_widget_message_document_title">([^<]+)</div>', resp)
                     doc_name = doc_name_match.group(1).strip() if doc_name_match else "document"
                     content_parts.append(f"[File: {doc_name}]")
-                    if doc_name.lower().endswith('.pdf'):
-                        try:
-                            import pdfplumber
-                            import io
-                            doc_req = Request(doc_url, headers={'User-Agent': 'Mozilla/5.0'})
-                            doc_data = urlopen(doc_req, timeout=30).read()
-                            with pdfplumber.open(io.BytesIO(doc_data)) as pdf:
-                                pdf_text = '\n'.join(page.extract_text() or '' for page in pdf.pages)
-                            if pdf_text.strip():
-                                content_parts.append("[PDF text content]: " + pdf_text.strip()[:3000])
-                            else:
-                                content_parts.append("[PDF contains no extractable text - may be scanned]")
-                        except Exception as e:
-                            content_parts.append(f"[Could not extract PDF text: {e}]")
-                    else:
-                        content_parts.append(f"[Direct download link: {doc_url}]")
+                    content_parts.append(f"[Download: {doc_url}]")
                 if video_urls:
                     content_parts.append("[This message contains a video - cannot process]")
                 if not text and not photo_urls and not doc_urls and not video_urls:
@@ -581,6 +616,13 @@ def agent_process(chat_id, prompt):
             return f"`$ {cmd}`\n```\n{out[:2000]}```"
         except Exception as e:
             return f"Exec error: {e}"
+
+    # Catch Om-only commands that fell through (wrong chat_id or OM_CHAT_ID not set)
+    om_only = ['userlog', 'userlogcsv', 'ul', '/userlog', '/userlogcsv']
+    if any(pl.startswith(c) or pl == c for c in om_only):
+        return "This command is restricted to the bot owner (OM_CHAT_ID). Set OM_CHAT_ID env var."
+    if pl.startswith('exec ') or pl.startswith('/exec ') or pl.startswith('run ') or pl.startswith('/run '):
+        return "This command is restricted to the bot owner (OM_CHAT_ID). Set OM_CHAT_ID env var."
 
     return ask_llm(chat_id, prompt)
 
