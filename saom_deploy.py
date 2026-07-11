@@ -27,6 +27,7 @@ GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 STORAGE_CHAT_ID = os.environ.get("STORAGE_CHAT_ID", "")  # private group for persistent state
+AUTH_FILE = os.path.join(_SCRIPT_DIR, "authorized.json")  # managed authorized-user list
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 log = logging.getLogger('saom')
@@ -79,9 +80,9 @@ MATH answers:
   B:C = 2:1
 
 NON-MATH answers:
-- Default: output ONLY 1-4 lines, concise prose
+- Be helpful, detailed, and natural — no artificial length limit
 - DO NOT use equation format for non-math questions
-- Full detail/prose only if user says "explain", "how", "steps", or "detail"
+- Keep prose responses conversational and informative
 
 Current time: July 2026.
 """
@@ -175,6 +176,25 @@ def _restore_state():
     except Exception as e:
         log.warning(f"State restore failed: {e}")
 
+def _load_auth():
+    global authorized_users
+    if os.path.exists(AUTH_FILE):
+        try:
+            with open(AUTH_FILE) as f:
+                data = json.load(f)
+                authorized_users = set(data.get("authorized", []))
+        except Exception:
+            authorized_users = set()
+    if OM_CHAT_ID and OM_CHAT_ID != '0':
+        owner_id = int(OM_CHAT_ID)
+        authorized_users.add(owner_id)
+        _save_auth()
+
+def _save_auth():
+    data = {"authorized": sorted(list(authorized_users))}
+    with open(AUTH_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
+
 # ── Conversation memory ──
 MAX_HISTORY = 10
 conversations = {}  # chat_id -> list of {"role": str, "content": str}
@@ -184,6 +204,7 @@ banned_users = set()  # chat_ids that are banned
 user_context = {}  # user_id -> {last_topic, last_msg, last_reply, timestamp}
 
 OM_CHAT_ID = os.environ.get('OM_CHAT_ID', '0')
+authorized_users = set()  # chat_ids authorized to use the bot
 save_counter = 0  # save state every N messages
 
 def _load(p):
@@ -291,7 +312,7 @@ def ask_llm(chat_id, user_msg):
         temp = 0.5
         maxtok = 256
     else:
-        concise_msg = "Answer concisely. 1-4 lines. No LaTeX. DO NOT use equation format for non-math questions.\n\n" + user_msg
+        concise_msg = "Answer naturally and helpfully. No LaTeX. DO NOT use equation format for non-math questions.\n\n" + user_msg
         temp = 0.7
         maxtok = 1024
     messages.append({"role": "user", "content": concise_msg})
@@ -349,7 +370,7 @@ def ask_llm_vision(chat_id, prompt, image_data, caption=""):
         vtemp = 0.3
         vmaxtok = 1024
     else:
-        vision_prompt = "Answer concisely. 1-4 lines. No LaTeX.\n\n" + prompt
+        vision_prompt = "Answer naturally and helpfully. No LaTeX.\n\n" + prompt
         vtemp = 0.3
         vmaxtok = 4096
     content = []
@@ -497,6 +518,42 @@ def agent_process(chat_id, prompt):
             name = user_profiles.get(cid, {}).get('name', 'Unknown')
             lines.append(f"- `{cid}` ({name})")
         return '\n'.join(lines)
+
+    # Authorized user management - Om only
+    if prompt.startswith('auth ') or prompt.startswith('/auth '):
+        if str(chat_id) != OM_CHAT_ID:
+            return "Only the bot owner can manage authorized users."
+        parts = prompt.split()
+        if len(parts) < 3:
+            return "Usage: /auth <add|remove|list> [chat_id]"
+        cmd = parts[1].lower()
+        if cmd == 'list':
+            if not authorized_users:
+                return "No authorized users. Add one with `/auth add <chat_id>`."
+            lines = [f"**Authorized Users** ({len(authorized_users)})"]
+            for cid in sorted(authorized_users):
+                name = user_profiles.get(cid, {}).get('name', 'Unknown')
+                marker = " (owner)" if str(cid) == OM_CHAT_ID else ""
+                lines.append(f"- `{cid}` ({name}){marker}")
+            return '\n'.join(lines)
+        if len(parts) < 3:
+            return "Usage: /auth <add|remove> <chat_id>"
+        try:
+            target = int(parts[2])
+        except ValueError:
+            return "Invalid chat_id. Must be a number."
+        if cmd == 'add':
+            authorized_users.add(target)
+            _save_auth()
+            return f"Added `{target}` to authorized users."
+        elif cmd == 'remove':
+            if str(target) == OM_CHAT_ID:
+                return "Cannot remove the owner from authorized users."
+            authorized_users.discard(target)
+            _save_auth()
+            return f"Removed `{target}` from authorized users."
+        else:
+            return "Usage: /auth <add|remove|list> [chat_id]"
 
     # Webhook / talk to other bots
     if prompt.startswith('webhook ') or prompt.startswith('/webhook ') or prompt.startswith('wh ') or prompt.startswith('/wh '):
@@ -676,6 +733,8 @@ def poll():
                         continue
                 if chat_id in banned_users and str(chat_id) != OM_CHAT_ID:
                     continue
+                if chat_id not in authorized_users and str(chat_id) != OM_CHAT_ID:
+                    continue
                 get_profile(chat_id, msg)
                 msg_id = msg.get('message_id')
                 photo = msg.get('photo')
@@ -722,20 +781,36 @@ def poll():
                         fr = json.loads(urlopen(f"{api}/getFile?file_id={file_id}", timeout=10).read())
                         fpath = fr['result']['file_path']
                         img_data = urlopen(f"{api.replace('/bot', '/file/bot')}/{fpath}", timeout=20).read()
-                        resp = ask_llm_vision(chat_id, f"Read all text in this image. If the image has Hindi/Devanagari text, read and preserve it exactly. Format math with Unicode (×, ÷, ≠, √, ², ³, ½, →, ∠, △, ⟂). Separate lines for equations. NEVER use LaTeX (no \(, no $, no backslash). User's request: {prompt}", img_data, caption=caption)
+                        # Check for /solve in caption or text before running vision
+                        check_solve = (caption + " " + text).lower().strip()
+                        has_solve = check_solve.startswith('/solve') or check_solve.startswith('solve ')
+                        if has_solve:
+                            resp = ask_llm_vision(chat_id, f"Read all text in this image. If the image has Hindi/Devanagari text, read and preserve it exactly. Format math with Unicode (×, ÷, ≠, √, ², ³, ½, →, ∠, △, ⟂). Separate lines for equations. NEVER use LaTeX (no \(, no $, no backslash). Solve the problem. User's request: {prompt}", img_data, caption=caption)
+                        else:
+                            # No /solve: silently extract text to context, no reply
+                            extracted = ask_llm_vision(chat_id, "Read all text in this image. If the image has Hindi/Devanagari text, read and preserve it exactly. Return just the extracted text content, nothing else.", img_data, caption=caption)
+                            if chat_id not in conversations:
+                                conversations[chat_id] = []
+                            conversations[chat_id].append({"role": "user", "content": f"[Image sent: {caption or 'photo'}]"})
+                            conversations[chat_id].append({"role": "assistant", "content": f"[Image text extracted]: {extracted[:500]}"})
+                            resp = None  # skip sending a reply
                     except Exception as e:
                         resp = f"Error processing image: {e}"
                 else:
                     log.info(f"From {chat_id} ({user_profiles[chat_id]['name']}): {prompt[:60]}")
                     resp = agent_process(chat_id, prompt)
-                # Send response as reply to original message
-                req = Request(f"{api}/sendMessage",
-                    data=json.dumps({'chat_id': chat_id, 'text': resp, 'parse_mode': 'Markdown', 'reply_to_message_id': msg_id}).encode(),
-                    headers={'Content-Type': 'application/json'}, method='POST')
-                urlopen(req, timeout=10)
+                # Send response as reply to original message (skip if None = silent extraction)
+                if resp is not None:
+                    req = Request(f"{api}/sendMessage",
+                        data=json.dumps({'chat_id': chat_id, 'text': resp, 'parse_mode': 'Markdown', 'reply_to_message_id': msg_id}).encode(),
+                        headers={'Content-Type': 'application/json'}, method='POST')
+                    urlopen(req, timeout=10)
+                    reply_text = resp[:200]
+                else:
+                    reply_text = "[Silent image extraction]"
                 # Track user context
                 if uid:
-                    user_context[uid] = {"last_topic": text[:200] if text else (caption or "")[:200], "last_msg": text[:200] if text else "", "last_reply": resp[:200], "timestamp": time.time()}
+                    user_context[uid] = {"last_topic": text[:200] if text else (caption or "")[:200], "last_msg": text[:200] if text else "", "last_reply": reply_text, "timestamp": time.time()}
                 message_log.append({
                     "chat_id": chat_id,
                     "name": clean_name(msg.get('from', {}).get('first_name', '?')),
@@ -748,7 +823,7 @@ def poll():
                     "chat_id": chat_id,
                     "name": "SAOM",
                     "username": "",
-                    "text": resp[:300],
+                    "text": reply_text,
                     "time": int(time.time()),
                     "role": "bot"
                 })
@@ -775,6 +850,7 @@ def main():
         log.error("Missing BOT_TOKEN or GROQ_KEY")
         sys.exit(1)
     _restore_state()
+    _load_auth()
     t = threading.Thread(target=poll, daemon=True)
     t.start()
     HTTPServer(('0.0.0.0', PORT), HealthHandler).serve_forever()
