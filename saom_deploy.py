@@ -27,7 +27,7 @@ GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 STORAGE_CHAT_ID = os.environ.get("STORAGE_CHAT_ID", "")  # private group for persistent state
-AUTH_FILE = os.path.join(_SCRIPT_DIR, "authorized.json")  # managed authorized-user list
+// AUTH_FILE = os.path.join(_SCRIPT_DIR, "authorized.json")  # managed authorized-user list
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 log = logging.getLogger('saom')
@@ -850,7 +850,7 @@ def main():
         log.error("Missing BOT_TOKEN or GROQ_KEY")
         sys.exit(1)
     _restore_state()
-    _load_auth()
+    // _load_auth()
     t = threading.Thread(target=poll, daemon=True)
     t.start()
     HTTPServer(('0.0.0.0', PORT), HealthHandler).serve_forever()
