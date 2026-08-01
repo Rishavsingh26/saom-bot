@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """SAOM — single-process Telegram bot for cloud deployment.
 Full SAOM agent with persona, conversation memory, and tool routing."""
-import json, os, sys, threading, time, logging, re
+import json, os, sys, signal, threading, time, logging, re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.request import Request, urlopen
 
@@ -27,7 +27,7 @@ GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 STORAGE_CHAT_ID = os.environ.get("STORAGE_CHAT_ID", "")  # private group for persistent state
-// AUTH_FILE = os.path.join(_SCRIPT_DIR, "authorized.json")  # managed authorized-user list
+AUTH_FILE = os.path.join(_SCRIPT_DIR, "authorized.json")  # managed authorized-user list (local fallback only; primary persistence is via pinned Telegram message)
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 log = logging.getLogger('saom')
@@ -106,6 +106,7 @@ def _build_state():
     _expire_context()
     return {
         "banned_users": list(banned_users),
+        "authorized_users": list(authorized_users),
         "message_log": message_log[-1000:],
         "user_profiles": {str(k): v for k, v in user_profiles.items()},
         "conversations": {str(k): v for k, v in conversations.items()},
@@ -143,7 +144,7 @@ def _save_state():
 
 def _restore_state():
     """Load state from pinned message in storage chat on startup."""
-    global state_msg_id, banned_users, message_log, user_profiles, conversations, user_context
+    global state_msg_id, banned_users, authorized_users, message_log, user_profiles, conversations, user_context
     if not STORAGE_CHAT_ID:
         return
     api = f"https://api.telegram.org/bot{BOT_TOKEN}/"
@@ -163,6 +164,7 @@ def _restore_state():
             return
         state = json.loads(text)
         banned_users = set(state.get('banned_users', []))
+        authorized_users = set(state.get('authorized_users', []))
         message_log = state.get('message_log', [])
         for k, v in state.get('user_profiles', {}).items():
             user_profiles[int(k)] = v
@@ -177,18 +179,22 @@ def _restore_state():
         log.warning(f"State restore failed: {e}")
 
 def _load_auth():
+    """Merge in the local-file authorized list (fallback for non-Render/no-STORAGE_CHAT_ID
+    deployments) on top of whatever _restore_state() already loaded from the pinned
+    Telegram message, which is the primary source of truth on Render."""
     global authorized_users
     if os.path.exists(AUTH_FILE):
         try:
             with open(AUTH_FILE) as f:
                 data = json.load(f)
-                authorized_users = set(data.get("authorized", []))
+                authorized_users |= set(data.get("authorized", []))
         except Exception:
-            authorized_users = set()
+            pass
     if OM_CHAT_ID and OM_CHAT_ID != '0':
         owner_id = int(OM_CHAT_ID)
         authorized_users.add(owner_id)
-        _save_auth()
+    _save_auth()
+    _save_state()
 
 def _save_auth():
     data = {"authorized": sorted(list(authorized_users))}
@@ -206,6 +212,9 @@ user_context = {}  # user_id -> {last_topic, last_msg, last_reply, timestamp}
 OM_CHAT_ID = os.environ.get('OM_CHAT_ID', '0')
 authorized_users = set()  # chat_ids authorized to use the bot
 save_counter = 0  # save state every N messages
+START_TIME = time.time()
+last_request_time = {}  # chat_id -> timestamp, for basic rate limiting
+RATE_LIMIT_SECONDS = 2  # min gap between LLM requests from the same chat
 
 def _load(p):
     try:
@@ -257,8 +266,20 @@ def _api_retry(req, max_retries=4):
                 raise
     raise Exception("Max retries exceeded")
 
+def _rate_limited(chat_id):
+    """Basic per-chat cooldown to stop rapid-fire spam from burning through the
+    Groq quota / bill. Returns True (and records the hit) if this chat must wait."""
+    now = time.time()
+    last = last_request_time.get(chat_id, 0)
+    if now - last < RATE_LIMIT_SECONDS:
+        return True
+    last_request_time[chat_id] = now
+    return False
+
 # ── LLM with history ──
 def ask_llm(chat_id, user_msg):
+    if _rate_limited(chat_id):
+        return "Whoa, slow down a bit — try again in a couple seconds."
     if chat_id not in conversations:
         conversations[chat_id] = []
     history = conversations[chat_id][-(MAX_HISTORY*2):]
@@ -337,6 +358,8 @@ def ask_llm(chat_id, user_msg):
 
 def ask_llm_vision(chat_id, prompt, image_data, caption=""):
     """Send prompt + image to Groq vision model."""
+    if _rate_limited(chat_id):
+        return "Whoa, slow down a bit — try again in a couple seconds."
     import base64
     b64 = base64.b64encode(image_data).decode()
     if image_data[:4] == b'\x89PNG':
@@ -400,6 +423,53 @@ def ask_llm_vision(chat_id, prompt, image_data, caption=""):
         return f"Vision LLM error: {e}"
 
 # ── SAOM tools ──
+TELEGRAM_MAX_LEN = 4096
+
+def send_message(api, chat_id, text, reply_to_message_id=None):
+    """Send a message, truncating to Telegram's length limit and falling back
+    to plain text if Markdown parsing fails (malformed markdown would otherwise
+    cause Telegram to reject the message and drop the reply entirely)."""
+    if len(text) > TELEGRAM_MAX_LEN:
+        text = text[:TELEGRAM_MAX_LEN - 20].rstrip() + "\n… [truncated]"
+    payload = {'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown'}
+    if reply_to_message_id:
+        payload['reply_to_message_id'] = reply_to_message_id
+    try:
+        req = Request(f"{api}/sendMessage", data=json.dumps(payload).encode(),
+                      headers={'Content-Type': 'application/json'}, method='POST')
+        resp = json.loads(urlopen(req, timeout=10).read())
+        if resp.get('ok'):
+            return
+    except Exception as e:
+        log.warning(f"sendMessage (markdown) failed: {e}")
+    # Fallback: retry without markdown parsing so the user still gets a reply
+    try:
+        payload.pop('parse_mode', None)
+        req = Request(f"{api}/sendMessage", data=json.dumps(payload).encode(),
+                      headers={'Content-Type': 'application/json'}, method='POST')
+        urlopen(req, timeout=10)
+    except Exception as e:
+        log.error(f"sendMessage (plain) failed: {e}")
+
+def _is_safe_url(url):
+    """Block requests to loopback, private, and link-local addresses (incl. cloud
+    metadata endpoints like 169.254.169.254) to stop /fetch and /webhook from being
+    used as an SSRF pivot into the hosting network. Only plain http(s) is allowed."""
+    import socket
+    import ipaddress
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+            return False
+        for info in socket.getaddrinfo(parsed.hostname, None):
+            ip = ipaddress.ip_address(info[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                return False
+        return True
+    except Exception:
+        return False
+
 def send_document(chat_id, file_bytes, filename):
     """Send a file to Telegram chat."""
     boundary = '----boundary' + str(int(time.time()))
@@ -428,6 +498,13 @@ def agent_process(chat_id, prompt):
 
     if pl in ('health', '/health', '/h'):
         return "SAOM is healthy and running on Render!"
+    if pl in ('ping', '/ping'):
+        return "Pong!"
+    if pl in ('uptime', '/uptime'):
+        secs = int(time.time() - START_TIME)
+        h, rem = divmod(secs, 3600)
+        m, s = divmod(rem, 60)
+        return f"Uptime: {h}h {m}m {s}s"
     if pl in ('stats', '/stats', '/st'):
         init = _load('init.json')
         ms = init.get('memory_stats', {})
@@ -444,7 +521,7 @@ def agent_process(chat_id, prompt):
                 "- Full Groq LLM responses\n"
                 "- User profiling (I know who you are)\n\n"
                 "**Commands:**\n"
-                "- /health, /stats, /version\n"
+                "- /health, /ping, /uptime, /stats, /version\n"
                 "- /save — download chat as .txt file\n"
                 "- /logs — show recent messages\n"
                 "- /clear — wipe conversation\n"
@@ -545,12 +622,14 @@ def agent_process(chat_id, prompt):
         if cmd == 'add':
             authorized_users.add(target)
             _save_auth()
+            _save_state()
             return f"Added `{target}` to authorized users."
         elif cmd == 'remove':
             if str(target) == OM_CHAT_ID:
                 return "Cannot remove the owner from authorized users."
             authorized_users.discard(target)
             _save_auth()
+            _save_state()
             return f"Removed `{target}` from authorized users."
         else:
             return "Usage: /auth <add|remove|list> [chat_id]"
@@ -561,6 +640,8 @@ def agent_process(chat_id, prompt):
         if len(parts) < 3:
             return "Usage: /webhook <url> <json_body>"
         url, body_str = parts[1], parts[2]
+        if not _is_safe_url(url):
+            return "Refusing to call that URL (blocked: local/private/internal address)."
         try:
             body = json.loads(body_str)
             data = json.dumps(body).encode()
@@ -602,7 +683,7 @@ def agent_process(chat_id, prompt):
                     try:
                         img_req = Request(img_url, headers={'User-Agent': 'Mozilla/5.0'})
                         img_data = urlopen(img_req, timeout=20).read()
-                        return ask_llm_vision(chat_id, f"Read all text in this image. If the image has Hindi/Devanagari text, read and preserve it exactly. Format math with Unicode (×, ÷, ≠, √, ², ³, ½, →, ∠, △, ⟂). Separate lines for equations. NEVER use LaTeX (no \(, no $, no backslash). User's request: {prompt}", img_data, caption=text)
+                        return ask_llm_vision(chat_id, f"Read all text in this image. If the image has Hindi/Devanagari text, read and preserve it exactly. Format math with Unicode (×, ÷, ≠, √, ², ³, ½, →, ∠, △, ⟂). Separate lines for equations. NEVER use LaTeX (no backslash-parentheses, no dollar signs, no backslash commands). User's request: {prompt}", img_data, caption=text)
                     except Exception as e:
                         return f"Could not download image from Telegram: {e}"
                 if doc_urls:
@@ -623,6 +704,8 @@ def agent_process(chat_id, prompt):
             return f"Telegram channel/profile: @{channel}. Use a specific message link like `t.me/{channel}/<message_id>` to read a message."
     if prompt.startswith('get ') or prompt.startswith('/get ') or prompt.startswith('fetch ') or prompt.startswith('/fetch '):
         url = prompt.split(maxsplit=1)[1]
+        if not _is_safe_url(url):
+            return "Refusing to fetch that URL (blocked: local/private/internal address)."
         try:
             req = Request(url, headers={'User-Agent': 'SAOM-bot/1.0'})
             resp = urlopen(req, timeout=15).read().decode('utf-8', errors='replace')
@@ -713,124 +796,127 @@ def poll():
             r = json.loads(urlopen(f"{api}/getUpdates?offset={offset}&timeout=30", timeout=35).read())
             for upd in r.get('result', []):
                 offset = upd['update_id'] + 1
-                msg = upd.get('message', {})
-                text = msg.get('text', '').strip()
-                chat_id = msg.get('chat', {}).get('id')
-                if not chat_id: continue
-                chat_type = msg.get('chat', {}).get('type', 'private')
-                user_id = msg.get('from', {}).get('id')
-                caption = msg.get('caption', '').strip()
-                # In groups: only respond if bot is @mentioned (check both text and caption)
-                if chat_type in ('group', 'supergroup'):
-                    check_text = (text + " " + caption).lower()
-                    if f"@{BOT_USERNAME}" not in check_text:
+                try:
+                    msg = upd.get('message', {})
+                    text = msg.get('text', '').strip()
+                    chat_id = msg.get('chat', {}).get('id')
+                    if not chat_id: continue
+                    chat_type = msg.get('chat', {}).get('type', 'private')
+                    user_id = msg.get('from', {}).get('id')
+                    caption = msg.get('caption', '').strip()
+                    # In groups: only respond if bot is @mentioned (check both text and caption)
+                    if chat_type in ('group', 'supergroup'):
+                        check_text = (text + " " + caption).lower()
+                        if f"@{BOT_USERNAME}" not in check_text:
+                            continue
+                        # Strip mention for cleaner prompt (case-insensitive)
+                        text = re.sub(rf'@{re.escape(BOT_USERNAME)}\b', '', text, flags=re.I).strip()
+                        caption = re.sub(rf'@{re.escape(BOT_USERNAME)}\b', '', caption, flags=re.I).strip()
+                        # Only admins can use the bot in groups
+                        if not _is_admin(api, chat_id, user_id):
+                            continue
+                    if chat_id in banned_users and str(chat_id) != OM_CHAT_ID:
                         continue
-                    # Strip mention for cleaner prompt (case-insensitive)
-                    text = re.sub(rf'@{re.escape(BOT_USERNAME)}\b', '', text, flags=re.I).strip()
-                    caption = re.sub(rf'@{re.escape(BOT_USERNAME)}\b', '', caption, flags=re.I).strip()
-                    # Only admins can use the bot in groups
-                    if not _is_admin(api, chat_id, user_id):
+                    if chat_id not in authorized_users and str(chat_id) != OM_CHAT_ID:
                         continue
-                if chat_id in banned_users and str(chat_id) != OM_CHAT_ID:
-                    continue
-                if chat_id not in authorized_users and str(chat_id) != OM_CHAT_ID:
-                    continue
-                get_profile(chat_id, msg)
-                msg_id = msg.get('message_id')
-                photo = msg.get('photo')
-                is_photo = bool(photo)
-                if is_photo:
-                    prompt = caption or "Describe this image"
-                elif not text:
-                    continue
-                else:
-                    prompt = text[1:] if text.startswith('/') else text
-                # Auto-read replied-to message for context
-                uid = msg.get('from', {}).get('id')
-                is_solve = text.lower().startswith('/solve') or text.lower().startswith('solve ')
-                reply_to = msg.get('reply_to_message')
-                if reply_to:
-                    rtext = reply_to.get('text', '').strip()
-                    rcaption = reply_to.get('caption', '').strip()
-                    rphoto = reply_to.get('photo')
-                    if rphoto:
-                        is_photo = True
-                        photo = rphoto
-                        caption = rcaption
-                        if is_solve:
-                            prompt = "Solve this problem from the image. SHORT ANSWER ONLY."
+                    get_profile(chat_id, msg)
+                    msg_id = msg.get('message_id')
+                    photo = msg.get('photo')
+                    is_photo = bool(photo)
+                    if is_photo:
+                        prompt = caption or "Describe this image"
+                    elif not text:
+                        continue
+                    else:
+                        prompt = text[1:] if text.startswith('/') else text
+                    # Auto-read replied-to message for context
+                    uid = msg.get('from', {}).get('id')
+                    is_solve = text.lower().startswith('/solve') or text.lower().startswith('solve ')
+                    reply_to = msg.get('reply_to_message')
+                    if reply_to:
+                        rtext = reply_to.get('text', '').strip()
+                        rcaption = reply_to.get('caption', '').strip()
+                        rphoto = reply_to.get('photo')
+                        if rphoto:
+                            is_photo = True
+                            photo = rphoto
+                            caption = rcaption
+                            if is_solve:
+                                prompt = "Solve this problem from the image. SHORT ANSWER ONLY."
+                        elif is_solve:
+                            prompt = f"Solve this. SHORT ANSWER ONLY (just result): {rtext[:500]}"
+                        elif rtext:
+                            prompt = f"Replied to: {rtext[:500]}\nUser: {prompt}"
                     elif is_solve:
-                        prompt = f"Solve this. SHORT ANSWER ONLY (just result): {rtext[:500]}"
-                    elif rtext:
-                        prompt = f"Replied to: {rtext[:500]}\nUser: {prompt}"
-                elif is_solve:
-                    query = prompt[6:].strip() if len(text) > 6 else ""
-                    prompt = f"SHORT ANSWER ONLY (just result): {query}" if query else "SHORT ANSWER ONLY."
-                # Inject user context for follow-ups (no reply, no solve)
-                if uid and uid in user_context and not reply_to and not is_solve and not prompt.startswith('/'):
-                    ctx = user_context[uid]
-                    if time.time() - ctx.get('timestamp', 0) < 1800:
-                        prompt = f"[Context: {ctx.get('last_topic', '')[:100]}]\n{prompt}"
-                # Show typing indicator while processing
-                urlopen(Request(f"{api}/sendChatAction", 
-                    data=json.dumps({'chat_id': chat_id, 'action': 'typing'}).encode(),
-                    headers={'Content-Type': 'application/json'}, method='POST'), timeout=5)
-                if is_photo:
-                    file_id = photo[-1]['file_id']
-                    try:
-                        fr = json.loads(urlopen(f"{api}/getFile?file_id={file_id}", timeout=10).read())
-                        fpath = fr['result']['file_path']
-                        img_data = urlopen(f"{api.replace('/bot', '/file/bot')}/{fpath}", timeout=20).read()
-                        # Check for /solve in caption or text before running vision
-                        check_solve = (caption + " " + text).lower().strip()
-                        has_solve = check_solve.startswith('/solve') or check_solve.startswith('solve ')
-                        if has_solve:
-                            resp = ask_llm_vision(chat_id, f"Read all text in this image. If the image has Hindi/Devanagari text, read and preserve it exactly. Format math with Unicode (×, ÷, ≠, √, ², ³, ½, →, ∠, △, ⟂). Separate lines for equations. NEVER use LaTeX (no \(, no $, no backslash). Solve the problem. User's request: {prompt}", img_data, caption=caption)
-                        else:
-                            # No /solve: silently extract text to context, no reply
-                            extracted = ask_llm_vision(chat_id, "Read all text in this image. If the image has Hindi/Devanagari text, read and preserve it exactly. Return just the extracted text content, nothing else.", img_data, caption=caption)
-                            if chat_id not in conversations:
-                                conversations[chat_id] = []
-                            conversations[chat_id].append({"role": "user", "content": f"[Image sent: {caption or 'photo'}]"})
-                            conversations[chat_id].append({"role": "assistant", "content": f"[Image text extracted]: {extracted[:500]}"})
-                            resp = None  # skip sending a reply
-                    except Exception as e:
-                        resp = f"Error processing image: {e}"
-                else:
-                    log.info(f"From {chat_id} ({user_profiles[chat_id]['name']}): {prompt[:60]}")
-                    resp = agent_process(chat_id, prompt)
-                # Send response as reply to original message (skip if None = silent extraction)
-                if resp is not None:
-                    req = Request(f"{api}/sendMessage",
-                        data=json.dumps({'chat_id': chat_id, 'text': resp, 'parse_mode': 'Markdown', 'reply_to_message_id': msg_id}).encode(),
-                        headers={'Content-Type': 'application/json'}, method='POST')
-                    urlopen(req, timeout=10)
-                    reply_text = resp[:200]
-                else:
-                    reply_text = "[Silent image extraction]"
-                # Track user context
-                if uid:
-                    user_context[uid] = {"last_topic": text[:200] if text else (caption or "")[:200], "last_msg": text[:200] if text else "", "last_reply": reply_text, "timestamp": time.time()}
-                message_log.append({
-                    "chat_id": chat_id,
-                    "name": clean_name(msg.get('from', {}).get('first_name', '?')),
-                    "username": msg.get('from', {}).get('username', ''),
-                    "text": (f"[Photo] {caption[:200]}" if is_photo else text)[:300],
-                    "time": int(time.time()),
-                    "role": "user"
-                })
-                message_log.append({
-                    "chat_id": chat_id,
-                    "name": "SAOM",
-                    "username": "",
-                    "text": reply_text,
-                    "time": int(time.time()),
-                    "role": "bot"
-                })
-                global save_counter
-                save_counter += 1
-                if save_counter % 10 == 0:
-                    _save_state()
+                        query = prompt[6:].strip() if len(text) > 6 else ""
+                        prompt = f"SHORT ANSWER ONLY (just result): {query}" if query else "SHORT ANSWER ONLY."
+                    # Inject user context for follow-ups (no reply, no solve)
+                    if uid and uid in user_context and not reply_to and not is_solve and not prompt.startswith('/'):
+                        ctx = user_context[uid]
+                        if time.time() - ctx.get('timestamp', 0) < 1800:
+                            prompt = f"[Context: {ctx.get('last_topic', '')[:100]}]\n{prompt}"
+                    # Show typing indicator while processing
+                    urlopen(Request(f"{api}/sendChatAction", 
+                        data=json.dumps({'chat_id': chat_id, 'action': 'typing'}).encode(),
+                        headers={'Content-Type': 'application/json'}, method='POST'), timeout=5)
+                    if is_photo:
+                        file_id = photo[-1]['file_id']
+                        try:
+                            fr = json.loads(urlopen(f"{api}/getFile?file_id={file_id}", timeout=10).read())
+                            fpath = fr['result']['file_path']
+                            img_data = urlopen(f"{api.replace('/bot', '/file/bot')}/{fpath}", timeout=20).read()
+                            # Check for /solve in caption or text before running vision
+                            check_solve = (caption + " " + text).lower().strip()
+                            has_solve = check_solve.startswith('/solve') or check_solve.startswith('solve ')
+                            if has_solve:
+                                resp = ask_llm_vision(chat_id, f"Read all text in this image. If the image has Hindi/Devanagari text, read and preserve it exactly. Format math with Unicode (×, ÷, ≠, √, ², ³, ½, →, ∠, △, ⟂). Separate lines for equations. NEVER use LaTeX (no backslash-parentheses, no dollar signs, no backslash commands). Solve the problem. User's request: {prompt}", img_data, caption=caption)
+                            else:
+                                # No /solve: silently extract text to context, no reply
+                                extracted = ask_llm_vision(chat_id, "Read all text in this image. If the image has Hindi/Devanagari text, read and preserve it exactly. Return just the extracted text content, nothing else.", img_data, caption=caption)
+                                if chat_id not in conversations:
+                                    conversations[chat_id] = []
+                                conversations[chat_id].append({"role": "user", "content": f"[Image sent: {caption or 'photo'}]"})
+                                conversations[chat_id].append({"role": "assistant", "content": f"[Image text extracted]: {extracted[:500]}"})
+                                resp = None  # skip sending a reply
+                        except Exception as e:
+                            resp = f"Error processing image: {e}"
+                    else:
+                        log.info(f"From {chat_id} ({user_profiles[chat_id]['name']}): {prompt[:60]}")
+                        resp = agent_process(chat_id, prompt)
+                    # Send response as reply to original message (skip if None = silent extraction)
+                    if resp is not None:
+                        send_message(api, chat_id, resp, reply_to_message_id=msg_id)
+                        reply_text = resp[:200]
+                    else:
+                        reply_text = "[Silent image extraction]"
+                    # Track user context
+                    if uid:
+                        user_context[uid] = {"last_topic": text[:200] if text else (caption or "")[:200], "last_msg": text[:200] if text else "", "last_reply": reply_text, "timestamp": time.time()}
+                    message_log.append({
+                        "chat_id": chat_id,
+                        "name": clean_name(msg.get('from', {}).get('first_name', '?')),
+                        "username": msg.get('from', {}).get('username', ''),
+                        "text": (f"[Photo] {caption[:200]}" if is_photo else text)[:300],
+                        "time": int(time.time()),
+                        "role": "user"
+                    })
+                    message_log.append({
+                        "chat_id": chat_id,
+                        "name": "SAOM",
+                        "username": "",
+                        "text": reply_text,
+                        "time": int(time.time()),
+                        "role": "bot"
+                    })
+                    if len(message_log) > 2000:
+                        del message_log[:-1000]
+                    global save_counter
+                    save_counter += 1
+                    if save_counter % 10 == 0:
+                        _save_state()
+                except Exception as e:
+                    log.error(f"Error handling update {upd.get('update_id')}: {e}")
+                    continue
         except Exception as e:
             log.error(f"Poll error: {e}")
             time.sleep(5)
@@ -850,7 +936,15 @@ def main():
         log.error("Missing BOT_TOKEN or GROQ_KEY")
         sys.exit(1)
     _restore_state()
-    // _load_auth()
+    _load_auth()
+
+    def _handle_shutdown(signum, frame):
+        log.info(f"Received signal {signum}, saving state before exit...")
+        _save_state()
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+    signal.signal(signal.SIGINT, _handle_shutdown)
+
     t = threading.Thread(target=poll, daemon=True)
     t.start()
     HTTPServer(('0.0.0.0', PORT), HealthHandler).serve_forever()
