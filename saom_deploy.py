@@ -132,7 +132,7 @@ def _sqlite_conn():
 
 def _apply_state(state):
     """Load a state dict (as produced by _build_state) into the in-memory globals."""
-    global banned_users, authorized_users, message_log, user_profiles, conversations, user_context
+    global banned_users, authorized_users, message_log, user_profiles, conversations, user_context, daily_usage
     banned_users = set(state.get('banned_users', []))
     authorized_users = set(state.get('authorized_users', []))
     message_log = state.get('message_log', [])
@@ -142,6 +142,8 @@ def _apply_state(state):
         conversations[int(k)] = v
     for k, v in state.get('user_context', {}).items():
         user_context[int(k)] = v
+    for k, v in state.get('daily_usage', {}).items():
+        daily_usage[int(k)] = v
     _expire_context()
 
 def trim_convs():
@@ -158,6 +160,11 @@ def _expire_context():
 def _build_state():
     trim_convs()
     _expire_context()
+    today = time.strftime('%Y-%m-%d', time.gmtime())
+    # Drop quota entries from previous days — no need to persist expired counters
+    stale_quota = [cid for cid, rec in daily_usage.items() if rec.get('date') != today]
+    for cid in stale_quota:
+        del daily_usage[cid]
     return {
         "banned_users": list(banned_users),
         "authorized_users": list(authorized_users),
@@ -165,6 +172,7 @@ def _build_state():
         "user_profiles": {str(k): v for k, v in user_profiles.items()},
         "conversations": {str(k): v for k, v in conversations.items()},
         "user_context": {str(k): v for k, v in user_context.items()},
+        "daily_usage": {str(k): v for k, v in daily_usage.items()},
         "updated_at": int(time.time())
     }
 
@@ -295,8 +303,26 @@ save_counter = 0  # save state every N messages
 START_TIME = time.time()
 last_request_time = {}  # chat_id -> timestamp, for basic rate limiting
 RATE_LIMIT_SECONDS = 2  # min gap between LLM requests from the same chat
-unauth_notice_sent = {}  # chat_id -> timestamp, so we don't spam the "not authorized" notice
+unauth_notice_sent = {}  # chat_id -> timestamp, so we don't spam the "limit reached" notice
 UNAUTH_NOTICE_COOLDOWN = 600  # only re-send the notice once per 10 minutes per chat
+daily_usage = {}  # chat_id -> {"date": "YYYY-MM-DD", "count": N}
+DAILY_MSG_LIMIT = 9  # non-trusted users get this many messages per UTC day; trusted/owner = unlimited
+
+def _is_trusted(chat_id):
+    return chat_id in authorized_users or str(chat_id) == OM_CHAT_ID
+
+def _check_and_use_quota(chat_id):
+    """Returns (allowed, remaining_after). Increments usage as a side effect when allowed."""
+    today = time.strftime('%Y-%m-%d', time.gmtime())
+    rec = daily_usage.get(chat_id)
+    if not rec or rec.get('date') != today:
+        rec = {'date': today, 'count': 0}
+    if rec['count'] >= DAILY_MSG_LIMIT:
+        daily_usage[chat_id] = rec
+        return False, 0
+    rec['count'] += 1
+    daily_usage[chat_id] = rec
+    return True, DAILY_MSG_LIMIT - rec['count']
 
 def _load(p):
     try:
@@ -614,11 +640,14 @@ def agent_process(chat_id, prompt):
     if pl in ('version', '/version', '/v'):
         return f"SAOM v{_load('init.json').get('version','?')}"
     if pl in ('help', '/help', '/start'):
+        limit_line = ("You have unlimited messages (trusted user)." if _is_trusted(chat_id)
+                      else f"You get {DAILY_MSG_LIMIT} free messages/day (resets midnight UTC).")
         return ("I am **SAOM** (Super Agent Ouroboros Manager), created by **Om**.\n"
                 "I'm a recursive self-improving AI agent with:\n"
                 "- Conversation memory (I remember our chat)\n"
                 "- Full Groq LLM responses\n"
                 "- User profiling (I know who you are)\n\n"
+                f"{limit_line}\n\n"
                 "**Commands:**\n"
                 "- /health, /ping, /uptime, /stats, /version\n"
                 "- /save — download chat as .txt file\n"
@@ -653,12 +682,20 @@ def agent_process(chat_id, prompt):
         return "Conversation cleared!"
     if pl in ('whoami', '/whoami', '/who'):
         p = user_profiles.get(chat_id, {})
+        if _is_trusted(chat_id):
+            quota_line = "- Access: unlimited (trusted user)\n"
+        else:
+            today = time.strftime('%Y-%m-%d', time.gmtime())
+            rec = daily_usage.get(chat_id, {})
+            used = rec.get('count', 0) if rec.get('date') == today else 0
+            quota_line = f"- Access: {max(0, DAILY_MSG_LIMIT - used)}/{DAILY_MSG_LIMIT} messages left today\n"
         return (f"**Your Profile**\n"
                 f"- Name: {p.get('name', '?')}\n"
                 f"- Username: @{p.get('username', 'none')}\n"
                 f"- Messages sent: {p.get('msg_count', 0)}\n"
                 f"- Language: {p.get('lang', 'en')}\n"
                 f"- Chat ID: `{chat_id}`\n"
+                f"{quota_line}"
                 f"- First seen: <code>{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(p.get('first_seen', 0)))}</code>")
 
     # Ban/unban - Om only
@@ -695,18 +732,19 @@ def agent_process(chat_id, prompt):
             lines.append(f"- `{cid}` ({name})")
         return '\n'.join(lines)
 
-    # Authorized user management - Om only
+    # Trusted (unlimited-quota) user management - Om only
     if prompt.startswith('auth ') or prompt.startswith('/auth '):
         if str(chat_id) != OM_CHAT_ID:
-            return "Only the bot owner can manage authorized users."
+            return "Only the bot owner can manage the trusted-user list."
         parts = prompt.split()
         if len(parts) < 2:
             return "Usage: /auth <add|remove|list> [chat_id]"
         cmd = parts[1].lower()
         if cmd == 'list':
             if not authorized_users:
-                return "No authorized users. Add one with `/auth add <chat_id>`."
-            lines = [f"**Authorized Users** ({len(authorized_users)})"]
+                return (f"No trusted users yet — everyone else gets {DAILY_MSG_LIMIT} free "
+                         f"messages/day. Grant unlimited access with `/auth add <chat_id>`.")
+            lines = [f"**Trusted Users (unlimited access)** ({len(authorized_users)})"]
             for cid in sorted(authorized_users):
                 name = user_profiles.get(cid, {}).get('name', 'Unknown')
                 marker = " (owner)" if str(cid) == OM_CHAT_ID else ""
@@ -722,14 +760,14 @@ def agent_process(chat_id, prompt):
             authorized_users.add(target)
             _save_auth()
             _save_state()
-            return f"Added `{target}` to authorized users."
+            return f"Granted `{target}` unlimited access (no more {DAILY_MSG_LIMIT}/day cap)."
         elif cmd == 'remove':
             if str(target) == OM_CHAT_ID:
-                return "Cannot remove the owner from authorized users."
+                return "Cannot remove the owner from the trusted list."
             authorized_users.discard(target)
             _save_auth()
             _save_state()
-            return f"Removed `{target}` from authorized users."
+            return f"Removed `{target}` from the trusted list — back to {DAILY_MSG_LIMIT} messages/day."
         else:
             return "Usage: /auth <add|remove|list> [chat_id]"
 
@@ -925,26 +963,25 @@ def poll():
                             continue
                     if chat_id in banned_users and str(chat_id) != OM_CHAT_ID:
                         continue
-                    if chat_id not in authorized_users and str(chat_id) != OM_CHAT_ID:
-                        # Log them (so the owner can find their real chat_id via /userlog)
-                        # and tell them their ID once, instead of silent, untraceable drop.
-                        get_profile(chat_id, msg)
-                        message_log.append({
-                            "chat_id": chat_id,
-                            "name": clean_name(msg.get('from', {}).get('first_name', '?')),
-                            "username": msg.get('from', {}).get('username', ''),
-                            "text": (text or caption or '[non-text message]')[:300],
-                            "time": int(time.time()),
-                            "role": "user"
-                        })
-                        if chat_type == 'private' and time.time() - unauth_notice_sent.get(chat_id, 0) > UNAUTH_NOTICE_COOLDOWN:
-                            unauth_notice_sent[chat_id] = time.time()
-                            send_message(api, chat_id,
-                                f"You're not authorized to use this bot yet.\n"
-                                f"Your chat ID is `{chat_id}` — this is a Telegram ID, "
-                                f"*not* your phone number. Ask the bot owner to run "
-                                f"`/auth add {chat_id}`.")
-                        continue
+                    if not _is_trusted(chat_id):
+                        allowed, remaining = _check_and_use_quota(chat_id)
+                        if not allowed:
+                            get_profile(chat_id, msg)
+                            message_log.append({
+                                "chat_id": chat_id,
+                                "name": clean_name(msg.get('from', {}).get('first_name', '?')),
+                                "username": msg.get('from', {}).get('username', ''),
+                                "text": (text or caption or '[non-text message]')[:300],
+                                "time": int(time.time()),
+                                "role": "user"
+                            })
+                            if chat_type == 'private' and time.time() - unauth_notice_sent.get(chat_id, 0) > UNAUTH_NOTICE_COOLDOWN:
+                                unauth_notice_sent[chat_id] = time.time()
+                                send_message(api, chat_id,
+                                    f"You've used your {DAILY_MSG_LIMIT} free messages for today. "
+                                    f"Limit resets at midnight UTC. Your chat ID is `{chat_id}` if the "
+                                    f"owner wants to grant unlimited access with `/auth add {chat_id}`.")
+                            continue
                     get_profile(chat_id, msg)
                     msg_id = msg.get('message_id')
                     photo = msg.get('photo')
