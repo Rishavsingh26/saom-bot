@@ -24,10 +24,21 @@ if not BASE:
 PORT = int(os.environ.get("PORT", 8080))
 BOT_TOKEN = os.environ.get("SAOM_BOT_TOKEN", "")
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
-MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
-STORAGE_CHAT_ID = os.environ.get("STORAGE_CHAT_ID", "")  # private group for persistent state
-AUTH_FILE = os.path.join(_SCRIPT_DIR, "authorized.json")  # managed authorized-user list (local fallback only; primary persistence is via pinned Telegram message)
+MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "qwen/qwen3.6-27b")
+STORAGE_CHAT_ID = os.environ.get("STORAGE_CHAT_ID", "")  # legacy fallback: private group for pinned-message state
+AUTH_FILE = os.path.join(_SCRIPT_DIR, "authorized.json")  # local fallback only (ephemeral on Render's free tier)
+
+# ── State backend (priority order) ──
+# 1. Upstash Redis (UPSTASH_REDIS_REST_URL/TOKEN) — free tier, survives Render redeploys, no disk needed.
+# 2. SQLite (MEMORY_DB_PATH) — needs a Render *persistent* disk mounted at that path, or local/Docker use;
+#    Render's free web services have an ephemeral filesystem, so a bare SQLite file there will NOT
+#    survive a redeploy any better than the old local-JSON approach.
+# 3. Telegram pinned-message (STORAGE_CHAT_ID) — original zero-infra fallback, kept for compatibility.
+UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "")
+UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
+MEMORY_DB_PATH = os.environ.get("MEMORY_DB_PATH", "")
+BUILD_TAG = "2026-08-02-r2"  # bump this whenever you deploy, then check /health to confirm it went live
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 log = logging.getLogger('saom')
@@ -43,6 +54,12 @@ GREEK_MAP = {
     'Theta': '\u0398', 'Lambda': '\u039b', 'Pi': '\u03a0', 'Sigma': '\u03a3',
     'Phi': '\u03a6', 'Omega': '\u03a9',
 }
+
+def strip_think(text):
+    """Some reasoning-model integrations leak <think>...</think> chain-of-thought
+    into the visible content field instead of keeping it in a separate channel.
+    Strip it defensively so it never ends up in a Telegram reply."""
+    return re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL).strip()
 
 def strip_latex(text):
     """Remove LaTeX - Telegram can't render it. Preserves Greek letters as Unicode."""
@@ -87,8 +104,45 @@ NON-MATH answers:
 Current time: July 2026.
 """
 
-# ── Telegram-based database (state persists via pinned message) ──
-state_msg_id = None  # message_id of the pinned state message
+# ── State persistence (pluggable backend — see UPSTASH_URL / MEMORY_DB_PATH / STORAGE_CHAT_ID above) ──
+state_msg_id = None  # message_id of the pinned state message (legacy Telegram backend only)
+
+def _upstash_cmd(*args):
+    """Call the Upstash Redis REST API using the body-style command form
+    (a JSON array), which avoids URL-encoding issues for large JSON values.
+    Returns the 'result' field, or None on any failure."""
+    try:
+        req = Request(UPSTASH_URL, data=json.dumps(list(args)).encode(),
+                      headers={"Authorization": f"Bearer {UPSTASH_TOKEN}",
+                               "Content-Type": "application/json"}, method='POST')
+        resp = json.loads(urlopen(req, timeout=10).read())
+        if 'error' in resp:
+            log.warning(f"Upstash error: {resp['error']}")
+            return None
+        return resp.get('result')
+    except Exception as e:
+        log.warning(f"Upstash request failed: {e}")
+        return None
+
+def _sqlite_conn():
+    import sqlite3
+    conn = sqlite3.connect(MEMORY_DB_PATH)
+    conn.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)")
+    return conn
+
+def _apply_state(state):
+    """Load a state dict (as produced by _build_state) into the in-memory globals."""
+    global banned_users, authorized_users, message_log, user_profiles, conversations, user_context
+    banned_users = set(state.get('banned_users', []))
+    authorized_users = set(state.get('authorized_users', []))
+    message_log = state.get('message_log', [])
+    for k, v in state.get('user_profiles', {}).items():
+        user_profiles[int(k)] = v
+    for k, v in state.get('conversations', {}).items():
+        conversations[int(k)] = v
+    for k, v in state.get('user_context', {}).items():
+        user_context[int(k)] = v
+    _expire_context()
 
 def trim_convs():
     """Trim conversations to last 5 exchanges per chat."""
@@ -115,11 +169,27 @@ def _build_state():
     }
 
 def _save_state():
-    """Persist state to the pinned message in storage chat."""
+    """Persist state via whichever backend is configured (Upstash > SQLite > Telegram pin)."""
     global state_msg_id
+    state = _build_state()
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        text = json.dumps(state, separators=(',', ':'))
+        if _upstash_cmd("SET", "saom:state", text) is not None:
+            return
+        log.warning("Upstash save failed, falling through to next backend")
+    if MEMORY_DB_PATH:
+        try:
+            conn = _sqlite_conn()
+            conn.execute("INSERT INTO kv (key, value) VALUES ('saom:state', ?) "
+                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                         (json.dumps(state, separators=(',', ':')),))
+            conn.commit()
+            conn.close()
+            return
+        except Exception as e:
+            log.warning(f"SQLite save failed, falling through to next backend: {e}")
     if not STORAGE_CHAT_ID:
         return
-    state = _build_state()
     text = json.dumps(state, separators=(',', ':'))
     api = f"https://api.telegram.org/bot{BOT_TOKEN}/"
     try:
@@ -140,11 +210,31 @@ def _save_state():
                     headers={'Content-Type': 'application/json'}, method='POST')
                 urlopen(req, timeout=10)
     except Exception as e:
-        log.warning(f"State save failed: {e}")
+        log.warning(f"State save failed (all backends exhausted): {e}")
 
 def _restore_state():
-    """Load state from pinned message in storage chat on startup."""
-    global state_msg_id, banned_users, authorized_users, message_log, user_profiles, conversations, user_context
+    """Load state on startup via whichever backend is configured (Upstash > SQLite > Telegram pin)."""
+    global state_msg_id
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        text = _upstash_cmd("GET", "saom:state")
+        if text:
+            try:
+                _apply_state(json.loads(text))
+                log.info(f"State restored from Upstash: {len(message_log)} msgs, {len(user_profiles)} users")
+                return
+            except Exception as e:
+                log.warning(f"Upstash state parse failed: {e}")
+    if MEMORY_DB_PATH:
+        try:
+            conn = _sqlite_conn()
+            row = conn.execute("SELECT value FROM kv WHERE key='saom:state'").fetchone()
+            conn.close()
+            if row:
+                _apply_state(json.loads(row[0]))
+                log.info(f"State restored from SQLite: {len(message_log)} msgs, {len(user_profiles)} users")
+                return
+        except Exception as e:
+            log.warning(f"SQLite state restore failed: {e}")
     if not STORAGE_CHAT_ID:
         return
     api = f"https://api.telegram.org/bot{BOT_TOKEN}/"
@@ -162,18 +252,8 @@ def _restore_state():
         text = pinned.get('text', pinned.get('caption', ''))
         if not text:
             return
-        state = json.loads(text)
-        banned_users = set(state.get('banned_users', []))
-        authorized_users = set(state.get('authorized_users', []))
-        message_log = state.get('message_log', [])
-        for k, v in state.get('user_profiles', {}).items():
-            user_profiles[int(k)] = v
-        for k, v in state.get('conversations', {}).items():
-            conversations[int(k)] = v
-        for k, v in state.get('user_context', {}).items():
-            user_context[int(k)] = v
-        _expire_context()
-        log.info(f"State restored: {len(message_log)} msgs, {len(banned_users)} bans, {len(user_profiles)} users, {len(conversations)} convs")
+        _apply_state(json.loads(text))
+        log.info(f"State restored from Telegram pin: {len(message_log)} msgs, {len(banned_users)} bans, {len(user_profiles)} users, {len(conversations)} convs")
         _save_state()  # update timestamp
     except Exception as e:
         log.warning(f"State restore failed: {e}")
@@ -215,6 +295,8 @@ save_counter = 0  # save state every N messages
 START_TIME = time.time()
 last_request_time = {}  # chat_id -> timestamp, for basic rate limiting
 RATE_LIMIT_SECONDS = 2  # min gap between LLM requests from the same chat
+unauth_notice_sent = {}  # chat_id -> timestamp, so we don't spam the "not authorized" notice
+UNAUTH_NOTICE_COOLDOWN = 600  # only re-send the notice once per 10 minutes per chat
 
 def _load(p):
     try:
@@ -325,23 +407,30 @@ def ask_llm(chat_id, user_msg):
     if is_solution_share and not any(kw in user_msg.lower() for kw in ['solve', 'find', 'calculate', '?', 'how to']):
         is_math = False
     if is_math:
-        concise_msg = "Answer ONLY with 3-7 equation lines. One equation per line. Intermediate working shown. Final answer on last line. No LaTeX. No prose. No reasoning. JUST EQUATIONS.\n\n" + user_msg
-        temp = 0.3
-        maxtok = 1024
+        concise_msg = "Solve this carefully, then output your final answer as ONLY 3-7 equation lines. One equation per line. Intermediate working shown. Final answer on last line. No LaTeX. No prose commentary in the final output. JUST EQUATIONS.\n\n" + user_msg
+        temp = 0.2
+        maxtok = 2048
+        reasoning_effort = "high"
     elif is_solution_share:
         concise_msg = "The user posted an answer/solution. Confirm it briefly and supportively. If correct, say 'Correct'. If wrong, give the right answer in 2-3 lines. No equations format.\n\n" + user_msg
         temp = 0.5
         maxtok = 256
+        reasoning_effort = "low"
     else:
         concise_msg = "Answer naturally and helpfully. No LaTeX. DO NOT use equation format for non-math questions.\n\n" + user_msg
         temp = 0.7
         maxtok = 1024
+        reasoning_effort = "low"
     messages.append({"role": "user", "content": concise_msg})
-    body = json.dumps({
+    body_dict = {
         "model": MODEL,
         "messages": messages,
         "max_tokens": maxtok, "temperature": temp
-    }).encode()
+    }
+    if MODEL.startswith("openai/gpt-oss") or MODEL.startswith("qwen/qwen3"):
+        body_dict["reasoning_effort"] = reasoning_effort
+        body_dict["reasoning_format"] = "hidden"
+    body = json.dumps(body_dict).encode()
     req = Request("https://api.groq.com/openai/v1/chat/completions",
                   data=body,
                   headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json",
@@ -349,6 +438,7 @@ def ask_llm(chat_id, user_msg):
                   method="POST")
     try:
         resp = _api_retry(req)['choices'][0]['message']['content'].strip()
+        resp = strip_think(resp)
         resp = strip_latex(resp)
         conversations[chat_id].append({"role": "user", "content": user_msg})
         conversations[chat_id].append({"role": "assistant", "content": resp})
@@ -389,23 +479,29 @@ def ask_llm_vision(chat_id, prompt, image_data, caption=""):
     if not is_math and not is_non_math:
         is_math = bool(re.search(r'\d+\s*:\s*\d+', prompt)) and not has_eq_question
     if is_math:
-        vision_prompt = "Answer ONLY with 3-7 equation lines. One equation per line. Intermediate working shown. Final answer on last line. No LaTeX. No prose. No reasoning. JUST EQUATIONS.\n\n" + prompt
-        vtemp = 0.3
-        vmaxtok = 1024
+        vision_prompt = "Read the problem carefully and solve it step by step internally, then output your final answer as ONLY 3-7 equation lines. One equation per line. Intermediate working shown. Final answer on last line. No LaTeX. No prose commentary in the final output. JUST EQUATIONS.\n\n" + prompt
+        vtemp = 0.2
+        vmaxtok = 2048
+        v_reasoning_effort = "high"
     else:
         vision_prompt = "Answer naturally and helpfully. No LaTeX.\n\n" + prompt
         vtemp = 0.3
         vmaxtok = 4096
+        v_reasoning_effort = "low"
     content = []
     if caption:
         content.append({"type": "text", "text": f"Caption: {caption}"})
     content.append({"type": "text", "text": vision_prompt})
     content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
-    body = json.dumps({
+    vbody_dict = {
         "model": VISION_MODEL,
         "messages": [{"role": "user", "content": content}],
         "max_tokens": vmaxtok, "temperature": vtemp
-    }).encode()
+    }
+    if VISION_MODEL.startswith("qwen/qwen3") or VISION_MODEL.startswith("openai/gpt-oss"):
+        vbody_dict["reasoning_effort"] = v_reasoning_effort
+        vbody_dict["reasoning_format"] = "hidden"
+    body = json.dumps(vbody_dict).encode()
     log.info(f"Vision request: model={VISION_MODEL}, caption={'yes' if caption else 'no'}, img_size={len(image_data)} bytes")
     req = Request("https://api.groq.com/openai/v1/chat/completions",
                   data=body,
@@ -414,6 +510,7 @@ def ask_llm_vision(chat_id, prompt, image_data, caption=""):
                   method="POST")
     try:
         resp = _api_retry(req)['choices'][0]['message']['content'].strip()
+        resp = strip_think(resp)
         resp = strip_latex(resp)
         if chat_id in conversations:
             conversations[chat_id].append({"role": "user", "content": f"[Image analysis] {prompt[:100]}"})
@@ -497,7 +594,7 @@ def agent_process(chat_id, prompt):
     pl = prompt.lower()
 
     if pl in ('health', '/health', '/h'):
-        return "SAOM is healthy and running on Render!"
+        return f"SAOM is healthy and running on Render! (build {BUILD_TAG}, model={MODEL})"
     if pl in ('ping', '/ping'):
         return "Pong!"
     if pl in ('uptime', '/uptime'):
@@ -601,7 +698,7 @@ def agent_process(chat_id, prompt):
         if str(chat_id) != OM_CHAT_ID:
             return "Only the bot owner can manage authorized users."
         parts = prompt.split()
-        if len(parts) < 3:
+        if len(parts) < 2:
             return "Usage: /auth <add|remove|list> [chat_id]"
         cmd = parts[1].lower()
         if cmd == 'list':
@@ -818,6 +915,24 @@ def poll():
                     if chat_id in banned_users and str(chat_id) != OM_CHAT_ID:
                         continue
                     if chat_id not in authorized_users and str(chat_id) != OM_CHAT_ID:
+                        # Log them (so the owner can find their real chat_id via /userlog)
+                        # and tell them their ID once, instead of silent, untraceable drop.
+                        get_profile(chat_id, msg)
+                        message_log.append({
+                            "chat_id": chat_id,
+                            "name": clean_name(msg.get('from', {}).get('first_name', '?')),
+                            "username": msg.get('from', {}).get('username', ''),
+                            "text": (text or caption or '[non-text message]')[:300],
+                            "time": int(time.time()),
+                            "role": "user"
+                        })
+                        if chat_type == 'private' and time.time() - unauth_notice_sent.get(chat_id, 0) > UNAUTH_NOTICE_COOLDOWN:
+                            unauth_notice_sent[chat_id] = time.time()
+                            send_message(api, chat_id,
+                                f"You're not authorized to use this bot yet.\n"
+                                f"Your chat ID is `{chat_id}` — this is a Telegram ID, "
+                                f"*not* your phone number. Ask the bot owner to run "
+                                f"`/auth add {chat_id}`.")
                         continue
                     get_profile(chat_id, msg)
                     msg_id = msg.get('message_id')
@@ -931,7 +1046,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
 def main():
-    log.info(f"SAOM starting | port={PORT} | model={MODEL}")
+    log.info(f"SAOM starting | build={BUILD_TAG} | port={PORT} | model={MODEL} | vision_model={VISION_MODEL}")
     if not BOT_TOKEN or not GROQ_KEY:
         log.error("Missing BOT_TOKEN or GROQ_KEY")
         sys.exit(1)
