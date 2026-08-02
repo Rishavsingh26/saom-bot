@@ -594,7 +594,9 @@ def agent_process(chat_id, prompt):
     pl = prompt.lower()
 
     if pl in ('health', '/health', '/h'):
-        return f"SAOM is healthy and running on Render! (build {BUILD_TAG}, model={MODEL})"
+        import socket as _socket
+        host = _socket.gethostname()
+        return f"SAOM is healthy and running on Render! (build {BUILD_TAG}, model={MODEL}, host={host}, pid={os.getpid()})"
     if pl in ('ping', '/ping'):
         return "Pong!"
     if pl in ('uptime', '/uptime'):
@@ -887,6 +889,15 @@ def poll():
         log.info(f"Bot username: @{BOT_USERNAME}")
     except:
         BOT_USERNAME = ""
+    try:
+        wh_info = json.loads(urlopen(f"{api}/getWebhookInfo", timeout=10).read())
+        if wh_info.get('result', {}).get('url'):
+            log.warning(f"A webhook was registered ({wh_info['result']['url']}) — this "
+                        f"blocks getUpdates from receiving anything. Removing it now.")
+            urlopen(Request(f"{api}/deleteWebhook", data=b'{}',
+                    headers={'Content-Type': 'application/json'}, method='POST'), timeout=10)
+    except Exception as e:
+        log.warning(f"Could not check/clear webhook: {e}")
     log.info("Bot polling started")
     while True:
         try:
@@ -1033,7 +1044,19 @@ def poll():
                     log.error(f"Error handling update {upd.get('update_id')}: {e}")
                     continue
         except Exception as e:
-            log.error(f"Poll error: {e}")
+            if '409' in str(e):
+                log.error(
+                    "CONFLICT (409) from Telegram getUpdates: another process is "
+                    "ALREADY polling this bot token right now. This means two instances "
+                    "are running simultaneously (e.g. an old Render deploy still alive "
+                    "during a rolling restart, a scaled service with >1 instance, or the "
+                    "bot also running somewhere else with the same SAOM_BOT_TOKEN). "
+                    "While both are up, replies will randomly come from whichever process "
+                    "wins each poll, which looks exactly like inconsistent/broken behavior. "
+                    "Check the Render dashboard for duplicate/leftover services and instance count."
+                )
+            else:
+                log.error(f"Poll error: {e}")
             time.sleep(5)
 
 # ── Health server ──
